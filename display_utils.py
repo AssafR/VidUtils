@@ -576,7 +576,7 @@ def display_thumbnails_stream_working(pd_it_it: packet_data_iterator_iterator, t
         print("No thumbnails to display")
 
 
-def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_per_row: int = 10):
+def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_per_row: int = 10, sampling_strategy: str = "first"):
     """
     Display thumbnails from a list of frame groups.
     Each group is a list of frames that were decoded together.
@@ -584,6 +584,7 @@ def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_p
     Args:
         frame_groups: List of frame lists, where each inner list contains frames from one group
         thumbs_per_row: Maximum number of thumbnails per row
+        sampling_strategy: "first" for first N frames, "bookend" for first N/2 + last N/2 frames
     """
     all_thumbs = []
     labels = []
@@ -597,8 +598,14 @@ def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_p
             print(f"Group {group_index}: No frames, skipping.")
             continue
         
-        # Only take the first thumbs_per_row frames for the row
-        chunk = frames[:thumbs_per_row]
+        # Select frames based on sampling strategy
+        if sampling_strategy == "bookend" and len(frames) > thumbs_per_row:
+            # Take first half and last half
+            half = thumbs_per_row // 2
+            chunk = frames[:half] + frames[-half:]
+        else:
+            # Take first N frames (default behavior)
+            chunk = frames[:thumbs_per_row]
         
         # Convert frames to thumbnails
         thumbs = []
@@ -624,7 +631,14 @@ def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_p
                 timecode_str = f" ({first_time:.3f}s-{last_time:.3f}s)"
             except:
                 timecode_str = ""
-            labels.append(f"group {group_index}, PTS {first_pts}-{last_pts}{timecode_str}")
+            
+            # Add sampling info to label
+            if sampling_strategy == "bookend" and len(frames) > thumbs_per_row:
+                sample_info = f" [first{thumbs_per_row//2}+last{thumbs_per_row//2}]"
+            else:
+                sample_info = f" [first{len(chunk)}]"
+            
+            labels.append(f"group {group_index}, PTS {first_pts}-{last_pts}{timecode_str}{sample_info}")
     
     if not all_thumbs:
         print("No thumbnails to display")
