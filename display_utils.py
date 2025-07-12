@@ -98,6 +98,55 @@ def convert_frames_to_thumbnails(frames: List, downsample_factor: int = 4) -> Li
     return thumbs
 
 
+def process_frame_group_for_display(frames: List, chunk: List, group_index: int, sampling_strategy: str, thumbs_per_row: int):
+    """
+    Process a frame group for display: convert frames to thumbnails and create the label.
+    
+    Args:
+        frames: Complete list of frames in the group
+        chunk: Selected frames for display (based on sampling strategy)
+        group_index: Index of the group
+        sampling_strategy: Sampling strategy used ("first", "bookend", "random")
+        thumbs_per_row: Maximum thumbnails per row
+    
+    Returns:
+        Tuple of (thumbnails_list, label_string) or (None, None) if no thumbnails
+    """
+    # Convert frames to thumbnails
+    thumbs = convert_frames_to_thumbnails(chunk)
+    
+    if not thumbs:
+        return None, None
+    
+    # Extract PTS and timecode information from the complete group
+    first_frame = frames[0]
+    last_frame = frames[-1]
+    first_pts = first_frame.pts if first_frame.pts is not None else 0
+    last_pts = last_frame.pts if last_frame.pts is not None else 0
+    
+    # Convert PTS to timecode if possible
+    try:
+        time_base = first_frame.time_base
+        first_time = first_pts * time_base if time_base else 0
+        last_time = last_pts * time_base if time_base else 0
+        timecode_str = f" ({first_time:.3f}s-{last_time:.3f}s)"
+    except:
+        timecode_str = ""
+    
+    # Create sampling strategy description for the label
+    if sampling_strategy == "bookend" and len(frames) > thumbs_per_row:
+        sample_info = f" [first{thumbs_per_row//2}+last{thumbs_per_row//2}]"
+    elif sampling_strategy == "random" and len(frames) > thumbs_per_row:
+        sample_info = f" [random{len(chunk)}]"
+    else:
+        sample_info = f" [first{len(chunk)}]"
+    
+    # Create the complete label
+    label = f"group {group_index}, PTS {first_pts}-{last_pts}{timecode_str}{sample_info}"
+    
+    return thumbs, label
+
+
 def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_per_row: int = 10, sampling_strategy: str = "first"):
     """
     Display thumbnails from a list of frame groups.
@@ -133,33 +182,12 @@ def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_p
             # Take first N frames (default behavior)
             chunk = frames[:thumbs_per_row]
         
-        # Convert frames to thumbnails
-        thumbs = convert_frames_to_thumbnails(chunk)
+        # Process the frame group for display (convert to thumbnails and create label)
+        thumbs, label = process_frame_group_for_display(frames, chunk, group_index, sampling_strategy, thumbs_per_row)
         
-        if thumbs:
+        if thumbs and label:
             all_thumbs.append(thumbs)
-            # Label shows the full group PTS/timecode range
-            first_frame = frames[0]
-            last_frame = frames[-1]
-            first_pts = first_frame.pts if first_frame.pts is not None else 0
-            last_pts = last_frame.pts if last_frame.pts is not None else 0
-            try:
-                time_base = first_frame.time_base
-                first_time = first_pts * time_base if time_base else 0
-                last_time = last_pts * time_base if time_base else 0
-                timecode_str = f" ({first_time:.3f}s-{last_time:.3f}s)"
-            except:
-                timecode_str = ""
-            
-            # Add sampling info to label
-            if sampling_strategy == "bookend" and len(frames) > thumbs_per_row:
-                sample_info = f" [first{thumbs_per_row//2}+last{thumbs_per_row//2}]"
-            elif sampling_strategy == "random" and len(frames) > thumbs_per_row:
-                sample_info = f" [random{len(chunk)}]"
-            else:
-                sample_info = f" [first{len(chunk)}]"
-            
-            labels.append(f"group {group_index}, PTS {first_pts}-{last_pts}{timecode_str}{sample_info}")
+            labels.append(label)
     
     # Display thumbnails using the extracted function
     title = f"Thumbnails ({sampling_strategy.capitalize()} Sampling)"
