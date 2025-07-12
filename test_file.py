@@ -17,12 +17,27 @@ def main():
     # Create the frame iterator
     frame_iterator = FileFrameIterator(filename)
     
-    # Apply filter to only get packets smaller than 50000 bytes
-    max_packet_size = 10000  # Increased from 2000 to get more frames
-
-    # Use seek-and-decode approach with PTS
-    print("Testing seek-and-decode approach with PTS:")
-    frame_groups = list(group_packets_by_pts_and_decode(filename, frame_iterator.iterator, lambda x: filter_small_packets(x, max_packet_size)))
+    # Apply multiple filters in a chain
+    print("Testing filter chaining approach:")
+    print("Note: Using streaming approach that doesn't store packets in memory")
+    
+    # Example 1: Size-based filtering (small packets between 500-10000 bytes)
+    filtered_stream_1 = chain_filters(
+        frame_iterator.iterator,
+        lambda x: filter_small_packets(x, 1000),  # Max 10KB
+        lambda x: filter_large_packets(x, 0)     # Min 500B
+    )
+    
+    # Example 2: Size + PTS range filtering
+    filtered_stream_2 = chain_filters(
+        frame_iterator.iterator,
+        lambda x: filter_small_packets(x, 200),   # Max 8KB
+        lambda x: filter_by_pts_range(x, 1000, 20000)  # PTS between 1000-20000
+    )
+    
+    # Use the first filter chain for demonstration with streaming approach
+    print("Using streaming approach (no memory storage of packets)...")
+    frame_groups = list(group_packets_by_pts_and_decode_streaming(filename, filtered_stream_1, lambda x: True))  # No additional filtering needed
     
     print(f"\n=== DETAILED FRAME GROUP ANALYSIS ===")
     print(f"Total frame groups: {len(frame_groups)}")

@@ -208,6 +208,24 @@ class FileFrameIterator:
             packet:packet_data = (packet_no, packet)
             yield packet
 
+def chain_filters(packet_stream, *filter_functions):
+    """
+    Chain multiple filters together using iterators.
+    A packet must pass ALL filters to be included.
+    
+    Args:
+        packet_stream: Iterator of (packet_no, packet) tuples
+        *filter_functions: Variable number of filter functions
+    
+    Yields:
+        Packets that pass all filters
+    """
+    for packet_data in packet_stream:
+        # Check if packet passes all filters
+        if all(filter_func(packet_data) for filter_func in filter_functions):
+            yield packet_data
+
+
 def filter_small_packets(packet_data: packet_data_type, max_size=1000):
     """
     Filter function that returns True if packet size is smaller than max_size.
@@ -221,6 +239,41 @@ def filter_small_packets(packet_data: packet_data_type, max_size=1000):
     """
     packet_no, packet = packet_data
     return packet.size < max_size
+
+
+def filter_large_packets(packet_data: packet_data_type, min_size=500):
+    """
+    Filter function that returns True if packet size is larger than min_size.
+    
+    Args:
+        packet_data: Tuple of (packet_no, packet)
+        min_size: Minimum packet size in bytes (default: 500)
+    
+    Returns:
+        bool: True if packet.size > min_size, False otherwise
+    """
+    packet_no, packet = packet_data
+    return packet.size > min_size
+
+
+def filter_by_pts_range(packet_data: packet_data_type, min_pts=0, max_pts=None):
+    """
+    Filter function that returns True if packet PTS is within the specified range.
+    
+    Args:
+        packet_data: Tuple of (packet_no, packet)
+        min_pts: Minimum PTS value (default: 0)
+        max_pts: Maximum PTS value (default: None for no upper limit)
+    
+    Returns:
+        bool: True if packet.pts is within range, False otherwise
+    """
+    packet_no, packet = packet_data
+    if packet.pts is None:
+        return False
+    if max_pts is None:
+        return packet.pts >= min_pts
+    return min_pts <= packet.pts <= max_pts
 
 def stream_frames_from_packet(packet_data: packet_data_type):
     """
@@ -467,6 +520,7 @@ def group_packets_by_pts_and_decode(filename: str, packet_stream, filter_func) -
     """
     Group packets by filter criteria and decode each group using seek-and-decode.
     This allows filtering out keyframes while still being able to decode the remaining packets.
+    Note: This uses a single-pass approach that loads packets into memory for simplicity and performance.
     
     Args:
         filename: Path to the video file
@@ -498,3 +552,109 @@ def group_packets_by_pts_and_decode(filename: str, packet_stream, filter_func) -
         frames = decode_group_with_seek(filename, group)
         if frames:
             yield frames
+
+def group_packets_by_pts_and_decode_streaming(filename: str, packet_stream, filter_func) -> Iterator[frame_list_type]:
+    """
+    Group packets by filter criteria and decode each group using seek-and-decode.
+    This is a true streaming approach that doesn't store packets in memory.
+    
+    Args:
+        filename: Path to the video file
+        packet_stream: Iterator of (packet_no, packet) tuples
+        filter_func: Function that takes (packet_no, packet) and returns bool
+    
+    Yields:
+        List of decoded frames for each group
+    """
+    # First pass: identify group boundaries and store minimal info needed for seeking
+    group_boundaries = []
+    current_group_start = None
+    current_group_end = None
+    
+    for packet_data in packet_stream:
+        packet_no, packet = packet_data
+        
+        if filter_func(packet_data):
+            # Packet matches filter
+            if current_group_start is None:
+                # Start of a new group
+                current_group_start = (packet_no, packet.pts)
+            current_group_end = (packet_no, packet.pts)
+        else:
+            # Packet doesn't match filter, end current group if it exists
+            if current_group_start is not None:
+                group_boundaries.append((current_group_start, current_group_end))
+                current_group_start = None
+                current_group_end = None
+    
+    # Handle the last group if it exists
+    if current_group_start is not None:
+        group_boundaries.append((current_group_start, current_group_end))
+    
+    # Second pass: process each group individually using seek-and-decode
+    for i, (start_info, end_info) in enumerate(group_boundaries):
+        start_packet_no, start_pts = start_info
+        end_packet_no, end_pts = end_info
+        
+        print(f"Processing group {i+1}/{len(group_boundaries)}: packets {start_packet_no}-{end_packet_no}, PTS {start_pts}-{end_pts}")
+        
+        # Decode this group using seek-and-decode
+        frames = decode_group_by_pts_range(filename, start_pts, end_pts)
+        if frames:
+            yield frames
+
+def decode_group_by_pts_range(filename: str, start_pts: int, end_pts: int) -> frame_list_type:
+    """
+    Decode frames for packets within a PTS range by seeking to the nearest previous keyframe.
+    
+    Args:
+        filename: Path to the video file
+        start_pts: Start PTS (inclusive)
+        end_pts: End PTS (inclusive)
+    
+    Returns:
+        List of decoded frames in the PTS range
+    """
+    # Open the file and seek to the nearest previous keyframe
+    container = av.open(filename, mode='r')
+    video_stream = container.streams.video[0]
+    
+    try:
+        # Seek to the nearest previous keyframe before the start PTS
+        container.seek(start_pts, any_frame=False, backward=True, stream=video_stream)
+        
+        frames = []
+        codec_context = video_stream.codec_context
+        
+        # Demux and decode from the seek position
+        for packet in container.demux(video_stream):
+            if packet.pts is None:
+                continue
+            
+            # Check if this packet is within our target PTS range
+            if start_pts <= packet.pts <= end_pts:
+                # Decode this packet
+                try:
+                    decoded_frames = codec_context.decode(packet)
+                    frames.extend(list(decoded_frames))
+                    print(f"Decoded packet with PTS {packet.pts}: {len(list(decoded_frames))} frames")
+                except Exception as e:
+                    print(f"Error decoding packet with PTS {packet.pts}: {e}")
+            
+            # Stop if we've passed the end PTS
+            if packet.pts > end_pts:
+                break
+        
+        # Flush the decoder to get any remaining frames
+        try:
+            remaining_frames = codec_context.decode(None)
+            frames.extend(list(remaining_frames))
+            if remaining_frames:
+                print(f"Got {len(list(remaining_frames))} remaining frames from flush")
+        except Exception as e:
+            print(f"Error during decoder flush: {e}")
+        
+        return frames
+        
+    finally:
+        container.close()
