@@ -1,5 +1,5 @@
 import sys
-from display_utils import display_thumbnails_from_frames, display_thumbnails_stream_fresh_context
+from display_utils import display_thumbnails_from_frames
 from vidfile_iterator import *
 import av
 import av.container, av.packet, av.stream
@@ -43,6 +43,9 @@ def main():
         
         print("\n=== Testing Bookend Sampling (First 5 + Last 5) ===")
         display_thumbnails_from_frames(frame_groups, sampling_strategy="bookend")
+        
+        print("\n=== Testing Random Sampling (10 random frames) ===")
+        display_thumbnails_from_frames(frame_groups, sampling_strategy="random")
     else:
         print("No frame groups to display")
 
