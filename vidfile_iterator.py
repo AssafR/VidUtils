@@ -1,5 +1,6 @@
 import av
 import av.container, av.packet, av.stream
+from av.packet import Packet
 import numpy as np
 from typing import Callable, List, Optional, Union, Iterator, Tuple
 from typing_extensions import TypeAlias
@@ -12,7 +13,7 @@ from itertools import groupby
     
 # Define types for later, packet_data and packet_data_iterator are used to store the packet data and the iterator respectively
 # Define a new type called packet_data that is a tuple of an integer and an av.packet.Packet
-packet_data_type: TypeAlias = Tuple[int, av.packet.Packet]
+packet_data_type: TypeAlias = Tuple[int, Packet]
 packet_data_iterator: TypeAlias = Iterator[packet_data_type]
 packet_data_iterator_iterator: TypeAlias = Iterator[packet_data_iterator]
 frame_list_type: TypeAlias = List[av.VideoFrame]
@@ -200,21 +201,25 @@ class FileFrameIterator:
         self.time_base = self.container_stream.time_base if self.container_stream.time_base else 1.0 / 25.0
         self.container_stream.thread_type = "AUTO"
         self.container_stream.thread_count = 1  # Set to 1 to avoid threading issues with frame extraction
-        self.packet_iterator = self.packet_iterator()
-        self.frame_iterator = self.frame_iterator()
+        self.packet_iterator: packet_data_iterator = self.get_packet_iterator()
+        self.frame_iterator: frame_data_iterator    = self.get_frame_iterator()
 
-    def packet_iterator(self) -> packet_data_iterator:
-        for packet_no, packet in enumerate(self.container.demux(self.container_stream)):
+    def get_packet_iterator(self) -> packet_data_iterator:
+        packet_data:packet_data_type
+        for packet_data in enumerate(self.container.demux(self.container_stream)):
+            packet_no, packet = packet_data
             # print("Processing packet number:", packet_no)
             packet:packet_data_type = (packet_no, packet)
             yield packet
 
-    def frame_iterator(self) -> frame_data_iterator:
-        for packet_data in self.packet_iterator():
+    def get_frame_iterator(self) -> frame_data_iterator:
+        frame_count = 0
+        for packet_data in self.packet_iterator:
             packet_no, packet = packet_data
             frames = decode_packet_to_frames(packet_data)
             for frame_no, frame in enumerate(frames):
-                yield (packet_no, frame_no, frame)
+                yield (packet_no, frame_count+frame_no, frame)
+            frame_count += len(frames)
 
     def close(self):
         self.container.close()
@@ -385,6 +390,23 @@ def decode_packet_to_frames_with_state(packet_data: packet_data_type, codec_cont
         print(f"Error decoding packet {packet_no}: {e}")
     
     return frames, codec_context
+
+
+def iterate_frames_from_packet_stream(packet_data_iterator: packet_data_iterator) -> frame_data_iterator:
+    """
+    Wraps around decode_all_packets_with_flush to provide a frame iterator from a packet stream.
+    
+    Args:
+        packet_data_iterator: Iterator of (packet_no, packet) tuples    
+    Yields:
+        Tuple of (packet_no, frame_no, frame) for each decoded frame
+    """
+    frame_count = -1 # Local frame count for this packet
+    for packet_no, frames in decode_all_packets_with_flush(packet_data_iterator):        
+        for frame_no, frame in enumerate(frames):
+            frame_count += 1
+            yield (packet_no, frame_count, frame)
+   
 
 def decode_all_packets_with_flush(packet_iterator, max_packets=None):
     """

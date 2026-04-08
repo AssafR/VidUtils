@@ -19,7 +19,7 @@ def test_modern_decoding():
     packet_count = 0
     max_packets_to_test = 30
     
-    for packet_data in frame_iterator.iterator:
+    for packet_data in frame_iterator.packet_iterator:
         stream_frames_from_packet(packet_data)
         packet_count += 1
         if packet_count >= max_packets_to_test:
@@ -30,7 +30,7 @@ def test_modern_decoding():
     frame_iterator = FileFrameIterator(filename)  # Reset iterator
     packet_count = 0
     
-    for packet_data in frame_iterator.iterator:
+    for packet_data in frame_iterator.packet_iterator:
         packet_no, packet = packet_data
         print(f"  Decoding packet {packet_no}...")
         frames = decode_packet_to_frames(packet_data)
@@ -52,7 +52,7 @@ def test_modern_decoding():
     # Process a few packets first
     frame_iterator = FileFrameIterator(filename)
     packet_count = 0
-    for packet_data in frame_iterator.iterator:
+    for packet_data in frame_iterator.packet_iterator:
         packet_no, packet = packet_data
         # Use decode instead of send for PyAV 14.4.0
         try:
