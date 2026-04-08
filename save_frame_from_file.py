@@ -26,7 +26,7 @@ def read_save_frame_from_file(frame_no=2):
         packet_count = 0
         frame_count = 0
 
-        for packet_data in frame_iterator.iterator:
+        for packet_data in frame_iterator.packet_iterator:
             packet_no, packet = packet_data
             print(f"  Decoding packet {packet_no}...")
             frames = decode_packet_to_frames(packet_data)
@@ -39,12 +39,12 @@ def read_save_frame_from_file(frame_no=2):
                 frame_np = np.array(frame_img)
                 frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
 
-                if frame_count >= 6:
-                    # Save the current frame to disk
-                    output_filename = f"saved_frame_{frame_count}.jpg"
-                    cv2.imwrite(output_filename, frame_bgr)
-                    print(f"Saved frame {frame_count} to {output_filename}")
-                    return  # Exit after saving the frame
+                # if frame_count >= 6:
+                #     # Save the current frame to disk
+                #     output_filename = f"saved_frame_{frame_count}.jpg"
+                #     cv2.imwrite(output_filename, frame_bgr)
+                #     print(f"Saved frame {frame_count} to {output_filename}")
+                #     return  # Exit after saving the frame
 
 
                 cv2.putText(frame_bgr, f"Frame {frame_count}:", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)

@@ -200,7 +200,8 @@ class FileFrameIterator:
         self.time_base = self.container_stream.time_base if self.container_stream.time_base else 1.0 / 25.0
         self.container_stream.thread_type = "AUTO"
         self.container_stream.thread_count = 1  # Set to 1 to avoid threading issues with frame extraction
-        self.iterator = self.packet_iterator()
+        self.packet_iterator = self.packet_iterator()
+        self.frame_iterator = self.frame_iterator()
 
     def packet_iterator(self) -> packet_data_iterator:
         for packet_no, packet in enumerate(self.container.demux(self.container_stream)):
