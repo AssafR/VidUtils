@@ -200,13 +200,24 @@ class FileFrameIterator:
         self.time_base = self.container_stream.time_base if self.container_stream.time_base else 1.0 / 25.0
         self.container_stream.thread_type = "AUTO"
         self.container_stream.thread_count = 1  # Set to 1 to avoid threading issues with frame extraction
-        self.iterator = self.frame_iterator()
+        self.iterator = self.packet_iterator()
 
-    def frame_iterator(self) -> packet_data_iterator:
+    def packet_iterator(self) -> packet_data_iterator:
         for packet_no, packet in enumerate(self.container.demux(self.container_stream)):
             # print("Processing packet number:", packet_no)
-            packet:packet_data = (packet_no, packet)
+            packet:packet_data_type = (packet_no, packet)
             yield packet
+
+    def frame_iterator(self) -> frame_data_iterator:
+        for packet_data in self.packet_iterator():
+            packet_no, packet = packet_data
+            frames = decode_packet_to_frames(packet_data)
+            for frame_no, frame in enumerate(frames):
+                yield (packet_no, frame_no, frame)
+
+    def close(self):
+        self.container.close()
+
 
 def chain_filters(packet_stream, *filter_functions):
     """

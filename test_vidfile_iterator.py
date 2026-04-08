@@ -17,7 +17,7 @@ def test_modern_decoding():
     # Test the stream_frames_from_packet function
     print("\n=== Testing stream_frames_from_packet ===")
     packet_count = 0
-    max_packets_to_test = 3
+    max_packets_to_test = 30
     
     for packet_data in frame_iterator.iterator:
         stream_frames_from_packet(packet_data)
