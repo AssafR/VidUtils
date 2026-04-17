@@ -1,6 +1,17 @@
 {
     "version": "0.2.0",
-    "configurations": [
+    "configurations": [        
+        {
+            "name": "Debug locate_noise",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/locate_noise.py",
+            "console": "integratedTerminal",
+            "args": [
+              "C:\\users\\assaf\\Desktop\\Temporary\\Video_With_Noise_2.mkv"
+            ],
+            "justMyCode": true
+        },
         {
             "name": "Python Debugger: Current File with Arguments",
             "type": "debugpy",
@@ -9,29 +20,5 @@
             "console": "integratedTerminal",
             "args": "${command:pickArgs}"
         },
-        {
-            "name": "Debug test_file.py",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/test_file.py",
-            "args": [
-                "E:\\Sample_Video_Static.mkv"
-            ],
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "justMyCode": true
-        },
-        {
-            "name": "Debug test_file.py (sample video)",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/test_file.py",
-            "args": [
-                "E:\\Sample_Video_Static.mkv"
-            ],
-            "console": "integratedTerminal",
-            "cwd": "${workspaceFolder}",
-            "justMyCode": true
-        }
-    ]
+   ]
 }

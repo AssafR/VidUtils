@@ -1,55 +1,26 @@
-from fileinput import filename
 import sys
+from typing import Any, Iterator
 import cv2
 import numpy as np
 from tqdm import tqdm
-from scipy.stats import entropy as scipy_entropy
-from utils import WindowClosed, WindowManager
+from utils import WindowClosed, WindowManager, get_frames_estimate
 from vidfile_iterator import (FileFrameIterator, iterate_frames_from_packet_stream, 
                               stream_frames_from_packet, decode_packet_to_frames,
-                             )
+                              get_frame_iterator_from_file, get_frames_from_iterator)
+from utils import calculate_mse_between_frames, _compute_entropy, EtaTqdm
+
 
 RESIZE_DIM_FOR_MSE = (64, 64)  # Resize dimensions for MSE calculation
 
-
-def _compute_entropy(data):
-    """
-    Compute Shannon entropy of 2D or 3D image data (grayscale or multi-channel).
-    For multi-channel, computes entropy per channel and returns the average.
-    
-    Args:
-        data: 2D array (grayscale) or 3D array (multi-channel)
-    
-    Returns:
-        Shannon entropy value
-    """
-    if data is None or data.size == 0:
-        return 0.0
-    
-    # Handle multi-channel images
-    if len(data.shape) == 3:
-        # Compute entropy for each channel and average
-        entropies = []
-        for channel in range(data.shape[2]):
-            channel_data = data[:, :, channel].flatten()
-            hist = np.histogram(channel_data, bins=256, range=(0, 256))[0]
-            hist = hist / hist.sum()
-            hist = hist[hist > 0]  # Avoid log(0)
-            entropies.append(scipy_entropy(hist, base=2))
-        return np.mean(entropies)
-    else:
-        # Grayscale image
-        flat_data = data.flatten()
-        hist = np.histogram(flat_data, bins=256, range=(0, 256))[0]
-        hist = hist / hist.sum()
-        hist = hist[hist > 0]  # Avoid log(0)
-        return scipy_entropy(hist, base=2)
+# Weights for ``combined_entropy`` in CSV / ``find_last_proper_video_frame`` (must match each other).
+FRAME_METRICS_COMBINED_LOCAL_WEIGHT = 0.7
+FRAME_METRICS_COMBINED_TEMPORAL_WEIGHT = 0.3
 
 
 def calculate_local_entropy(gray, blur_ksize=5):
     """Calculate entropy of the local high-frequency residual around the frame."""
-    blur = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
-    residual = cv2.absdiff(gray, blur)
+    blur = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0).astype(np.uint8)
+    residual = cv2.absdiff(gray, blur)#.astype(np.uint8)
     return _compute_entropy(residual)
 
 
@@ -92,6 +63,117 @@ def is_proper_frame(frame_bgr, previous_bgr=None, mean_threshold=50.0, local_ent
     combined_entropy = (1 - temporal_entropy_weight) * local_entropy_val + temporal_entropy_weight * temporal_entropy_val
     return is_proper_frame_params(mean_val, combined_entropy, mean_threshold, local_entropy_threshold)
 
+
+functions_to_calculate_metrics_dict = {
+    "timestamp": lambda **kwargs: kwargs["frame_no"] / kwargs["fps"] if kwargs["fps"] > 0 else 0.0,
+    "frame": lambda **kwargs: kwargs["frame_no"],
+    "mean": lambda **kwargs: np.mean(kwargs["frame_bgr"]),
+    "local_entropy": lambda **kwargs: calculate_local_entropy(kwargs["frame_bgr"]),
+    # "temporal_entropy": lambda **kwargs: calculate_temporal_entropy(kwargs["current_gray"], kwargs["previous_gray"]),
+    # "edge_density": lambda **kwargs: calculate_edge_density(kwargs["gray_for_edges"]),
+    # "hist_entropy": lambda **kwargs: calculate_histogram_entropy(kwargs["gray_for_edges"]),
+    "laplacian_variance": lambda **kwargs: calculate_laplacian_variance(kwargs["gray_for_edges"]),
+}
+
+def compute_frame_metrics_row(
+    frame_bgr: np.ndarray,
+    previous_bgr: np.ndarray | None,
+    frame_no: int,
+    fps: float,
+) -> dict[str, float | int]:
+    """
+    One row of the same metrics written to ``debug_csv`` in ``find_last_proper_video_frame``.
+
+    Use with ``iter_frame_metrics_rows`` to stream metrics without a CSV file (same pipeline as the notebook).
+    """
+
+    gray_for_edges = (
+        cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if len(frame_bgr.shape) == 3 else frame_bgr
+    )
+    if previous_bgr is None:
+        previous_gray = gray_for_edges
+    else:
+        previous_gray = (
+            cv2.cvtColor(previous_bgr, cv2.COLOR_BGR2GRAY) if len(previous_bgr.shape) == 3 else previous_bgr
+        )
+
+
+    all_params = {
+        "frame_bgr": frame_bgr,
+        "previous_bgr": previous_bgr,
+        "current_gray": gray_for_edges,
+        "previous_gray": previous_gray,
+        "frame_no": frame_no,
+        "fps": fps,
+        "gray_for_edges": gray_for_edges,
+    }
+
+    metrics = {}
+    for metric_name, metric_function in functions_to_calculate_metrics_dict.items():
+        # print("All params: ", all_params)
+        metrics[metric_name] = metric_function(**all_params)
+    
+    return metrics
+
+    # timestamp = frame_no / fps if fps > 0 else 0.0
+    # mean_val = float(np.mean(frame_bgr))
+    # local_entropy_val = calculate_local_entropy(frame_bgr)
+    # temporal_entropy_val = calculate_temporal_entropy(frame_bgr, previous_bgr)
+    # combined_entropy = (
+    #     FRAME_METRICS_COMBINED_LOCAL_WEIGHT * local_entropy_val
+    #     + FRAME_METRICS_COMBINED_TEMPORAL_WEIGHT * temporal_entropy_val
+    # )
+    # # print('frame_bgr.shape: ', frame_bgr.shape)
+    # hist_entropy = calculate_histogram_entropy(frame_bgr)
+
+    # edge_density = calculate_edge_density(gray_for_edges)
+    # laplacian_var = calculate_laplacian_variance(gray_for_edges)
+    # return {
+    #     "frame": frame_no,
+    #     "timestamp": timestamp,
+    #     "mean": mean_val,
+    #     "local_entropy": local_entropy_val,
+    #     "temporal_entropy": temporal_entropy_val,
+    #     "combined_entropy": combined_entropy,
+    #     "edge_density": edge_density,
+    #     "hist_entropy": hist_entropy,
+    #     "laplacian_variance": laplacian_var,
+    # }
+
+    # return {
+    #     "frame": 0,
+    #     "timestamp": 0,
+    #     "mean": 0.0,
+    #     "local_entropy": 0.0,
+    #     "temporal_entropy": 0.0,
+    #     "combined_entropy": 0.0,
+    #     "edge_density": 0.0,
+    #     "hist_entropy": 0.0,
+    #     "laplacian_variance": 0.0,
+    # }
+
+
+
+
+def iter_frame_metrics_rows(
+    # image_iterator: Iterator[tuple[int, np.ndarray]],
+    image_iterator: Iterator[tuple[int, np.ndarray]],
+    total_frames: int,
+    fps: float,
+) -> Iterator[dict[str, float | int]]:
+    """
+    Yield metric dicts in CSV column order for each ``(frame_no, frame_bgr)`` from ``image_iterator``.
+
+    Maintains ``previous_bgr`` exactly like ``find_last_proper_video_frame``.
+    """
+    previous_bgr = None
+    for frame_no, frame_bgr in EtaTqdm(image_iterator, total=total_frames, desc="Processing frames"):
+        metrics = compute_frame_metrics_row(frame_bgr, previous_bgr, frame_no, fps)
+        # print('metrics: ', metrics)
+        yield metrics
+        previous_bgr = frame_bgr
+
+
 def is_proper_frame_params(frame_mean, frame_entropy, mean_threshold, entropy_threshold):
     """
     Check if a frame is 'proper' (not noise/black) based on mean and local entropy.
@@ -115,13 +197,11 @@ def find_last_proper_video_frame(video_file, mean_threshold=0.0, local_entropy_t
     Returns:
         Tuple of (frame_no, frame_image) for the last proper frame, or (None, None) if none found
     """
-    image_iterator = get_image_iterator_from_file(video_file)
+    frame_iterator = get_frame_iterator_from_file(video_file)
+    image_iterator = get_frames_from_iterator(frame_iterator)
     
     # Estimate total frames from video metadata (may be inaccurate)
-    cap = cv2.VideoCapture(video_file)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else None
-    fps = cap.get(cv2.CAP_PROP_FPS) if cap.isOpened() else 25.0  # Default FPS if unavailable
-    cap.release()
+    total_frames, fps = get_frames_estimate(video_file)
     
     last_proper_frame_no = None
     last_proper_frame_bgr = None
@@ -135,40 +215,31 @@ def find_last_proper_video_frame(video_file, mean_threshold=0.0, local_entropy_t
 
     metrics_log = []
 
-    with tqdm(image_iterator, total=total_frames, desc="Processing frames") as pbar:
+    with EtaTqdm(image_iterator, total=total_frames, desc="Processing frames") as pbar:
         for frame_no, frame_bgr in pbar:
-            timestamp = frame_no / fps if fps > 0 else 0
+            row = compute_frame_metrics_row(frame_bgr, previous_bgr, frame_no, fps)
+            mean_val = row["mean"]
+            local_entropy_val = row["local_entropy"]
+            temporal_entropy_val = row["temporal_entropy"]
+            combined_entropy = row["combined_entropy"]
+            edge_density = row["edge_density"]
+            laplacian_var = row["laplacian_variance"]
+            timestamp = row["timestamp"]
 
-            mean_val = np.mean(frame_bgr)
-            local_entropy_val = calculate_local_entropy(frame_bgr)
-            temporal_entropy_val = calculate_temporal_entropy(frame_bgr, previous_bgr)
-            combined_entropy = 0.7 * local_entropy_val + 0.3 * temporal_entropy_val
-            
-            # For edge density, convert to grayscale
-            gray_for_edges = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY) if len(frame_bgr.shape) == 3 else frame_bgr
-            edge_density = calculate_edge_density(gray_for_edges)
-            hist_entropy = calculate_histogram_entropy(frame_bgr)
-            laplacian_var = calculate_laplacian_variance(gray_for_edges)
-
-            pbar.set_postfix({'frame': frame_no, 'time': f"{timestamp:.2f}s", 
-                              'mean': f"{mean_val:.1f}", 
-                              'local_ent': f"{local_entropy_val:.2f}", 'temp_ent': f"{temporal_entropy_val:.2f}", 
-                              'combined': f"{combined_entropy:.2f}", 
-                              'edges': f"{edge_density:.3f}", 'lap_var': f"{laplacian_var:.1f}"})
+            pbar.set_postfix({
+                    'frame': frame_no, 
+                    'time': f"{timestamp:.2f}s", 
+                    'mean': f"{mean_val:.1f}", 
+                    'local_ent': f"{local_entropy_val:.2f}", 
+                    'temp_ent': f"{temporal_entropy_val:.2f}", 
+                    'combined': f"{combined_entropy:.2f}", 
+                    'edges': f"{edge_density:.3f}", 
+                    'lap_var': f"{laplacian_var:.1f}"}
+                )
             
 
             if debug_csv:
-                metrics_log.append({
-                    'frame': frame_no,
-                    'timestamp': timestamp,
-                    'mean': mean_val,
-                    'local_entropy': local_entropy_val,
-                    'temporal_entropy': temporal_entropy_val,
-                    'combined_entropy': combined_entropy,
-                    'edge_density': edge_density,
-                    'hist_entropy': hist_entropy,
-                    'laplacian_variance': laplacian_var
-                })
+                metrics_log.append(row)
 
             if is_proper_frame_params(mean_val, combined_entropy, mean_threshold, local_entropy_threshold):
                 last_proper_frame_no = frame_no
@@ -198,45 +269,6 @@ def _save_metrics_csv(filepath, metrics_list):
         writer.writerows(metrics_list)
     print(f"Metrics saved to {filepath}")
 
-
-def mse(image1, image2):
-    """Calculate Mean Squared Error between two images."""
-    return np.mean((image1.astype(np.float32) - image2.astype(np.float32)) ** 2)
-
-def calculate_mse_between_frames(frame_bgr, ref_img):
-        # Convert frame to grayscale
-        frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        # Convert reference to grayscale for comparison
-        ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
-    
-    # Resize both images to the same size before extracting central region
-        target_shape = ref_gray.shape
-        if frame_gray.shape != target_shape:
-            frame_gray = cv2.resize(frame_gray, (target_shape[1], target_shape[0]))
-        if ref_gray.shape != target_shape:
-            ref_gray = cv2.resize(ref_gray, (target_shape[1], target_shape[0]))
-
-        # Take only the central region of the frame for comparison (optional)
-        h, w = target_shape
-        center_region = frame_gray[h//4:3*h//4, w//4:3*w//4]
-        # Take only the central region of the reference image for comparison (optional)
-        ref_center_region = ref_gray[h//4:3*h//4, w//4:3*w//4]
-        # Take only the central region of the frame for comparison (optional)
-        h, w = frame_gray.shape   
-        center_region = frame_gray[h//4:3*h//4, w//4:3*w//4]
-        # Take only the central region of the reference image for comparison (optional)
-        ref_center_region = ref_gray[h//4:3*h//4, w//4:3*w//4]
-
-
-        # Resize both images to a smaller size for faster MSE calculation (optional)
-        frame_gray_small = cv2.resize(center_region, RESIZE_DIM_FOR_MSE)
-        ref_gray_small = cv2.resize(ref_center_region, RESIZE_DIM_FOR_MSE)   
-
-        
-        # Calculate MSE
-        mse_value = mse(ref_gray_small, frame_gray_small)
-
-        return mse_value
 
 
 
@@ -272,57 +304,20 @@ def find_first_dissimilar_frame(video_file, reference_image_path, min_frame=0, m
     return None, None  # No dissimilar frame found
 
 
-def get_packet_iterator_from_file(filename):
-    """Test the modern decoding approach in vidfile_iterator.py"""
-    if len(sys.argv) < 2:
-        print("Usage: python test_vidfile_iterator.py <video_file>")
-        sys.exit(1)
-    
-    print(f"Reading file: {filename}")
-    
-    # Create the frame iterator
-    frame_iterator = FileFrameIterator(filename)    
-    return frame_iterator.packet_iterator
 
 
-def get_frame_iterator_from_file(filename):
-    """Test the modern decoding approach in vidfile_iterator.py"""
-    if len(sys.argv) < 2:
-        print("Usage: python test_vidfile_iterator.py <video_file>")
-        sys.exit(1)
-    
-    print(f"Testing modern decoding in vidfile_iterator.py with: {filename}")
-    
-    # Create the frame iterator
-    frame_iterator = FileFrameIterator(filename)    
-    return frame_iterator.frame_iterator
-
-def get_frames_from_iterator(frame_iterator, max_frames=10):
-    """Helper function to get frames from the frame iterator"""
-    frames = []
-    frame_count = 0
-    
-    for frame_data in frame_iterator:
-        packet_no, frame_no, frame = frame_data
-        frame_img = frame.to_image()
-        frame_np = np.array(frame_img)
-        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)    
-        yield frame_no, frame_bgr
-    
-    return 
-
-
-def get_image_iterator_from_file(filename=sys.argv[1]):
-    packet_iterator = get_packet_iterator_from_file(filename)
-    frame_iterator = iterate_frames_from_packet_stream(packet_iterator)
-    image_iterator = get_frames_from_iterator(frame_iterator)
-    return image_iterator
+# def get_image_iterator_from_file(filename=sys.argv[1]):
+#     packet_iterator = get_packet_iterator_from_file(filename)
+#     frame_iterator = iterate_frames_from_packet_stream(packet_iterator)
+#     image_iterator = get_frames_from_iterator(frame_iterator)
+#     return image_iterator
 
 
 
 def read_save_frame_from_file(filename=sys.argv[1]):
 
-    image_iterator = get_image_iterator_from_file(filename)
+    frame_iterator = get_frame_iterator_from_file(filename)
+    image_iterator = get_frames_from_iterator(frame_iterator)
 
     with WindowManager('Frame Window'):
         packet_count = 0

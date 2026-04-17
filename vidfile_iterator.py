@@ -6,6 +6,8 @@ from typing import Callable, List, Optional, Union, Iterator, Tuple
 from typing_extensions import TypeAlias
 from fractions import Fraction
 from itertools import groupby
+import cv2
+import sys
 
 
 # Note: If you're seeking/jumping: Always flush after seeking to clear stale state
@@ -56,7 +58,10 @@ def _create_consecutive_iterator(start_packet_data: packet_data_type, stream_ite
         yield next_packet_data
         last_packet_no = next_packet_no
 
-def _process_single_stream(stream: packet_data_iterator, filter_func: Callable[[packet_data_type], bool]) -> packet_data_iterator_iterator:
+def _process_single_stream(
+    stream: packet_data_iterator, 
+    filter_func: Callable[[packet_data_type], bool]
+    ) -> packet_data_iterator_iterator:
     """
     Process a single packet stream while preserving consecutivity.
     
@@ -200,7 +205,7 @@ class FileFrameIterator:
         self.container_stream = self.container.streams.video[0]
         self.time_base = self.container_stream.time_base if self.container_stream.time_base else 1.0 / 25.0
         self.container_stream.thread_type = "AUTO"
-        self.container_stream.thread_count = 1  # Set to 1 to avoid threading issues with frame extraction
+        # self.container_stream.thread_count = 1  # Set to 1 to avoid threading issues with frame extraction
         self.packet_iterator: packet_data_iterator = self.get_packet_iterator()
         self.frame_iterator: frame_data_iterator    = self.get_frame_iterator()
 
@@ -692,3 +697,37 @@ def decode_group_by_pts_range(filename: str, start_pts: int, end_pts: int) -> fr
         
     finally:
         container.close()
+
+
+def get_packet_iterator_from_file(filename):
+    """Test the modern decoding approach in vidfile_iterator.py"""
+    if len(sys.argv) < 2:
+        print("Usage: python test_vidfile_iterator.py <video_file>")
+        sys.exit(1)
+    
+    print(f"Reading file: {filename}")
+    
+    # Create the frame iterator
+    frame_iterator = FileFrameIterator(filename)
+    return frame_iterator.packet_iterator
+
+
+def get_frame_iterator_from_file(filename):
+    """Test the modern decoding approach in vidfile_iterator.py"""
+    if len(sys.argv) < 2:
+        print("Usage: python test_vidfile_iterator.py <video_file>")
+        sys.exit(1)
+    
+    print(f"Testing modern decoding in vidfile_iterator.py with: {filename}")
+    
+    # Create the frame iterator
+    frame_iterator = FileFrameIterator(filename)    
+    return frame_iterator.frame_iterator
+
+def get_frames_from_iterator(frame_iterator: frame_data_iterator) -> Iterator[tuple[int, np.ndarray]]:
+    frame_data:frame_data_type = None
+    for frame_data in frame_iterator:
+        packet_no, frame_no, frame = frame_data
+        frame_nd = frame.to_ndarray(format="yuv420p") # "yuv420p" "bgr24"   "gray"
+        yield frame_no, frame_nd
+    return 
