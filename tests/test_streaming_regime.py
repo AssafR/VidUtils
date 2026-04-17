@@ -14,7 +14,6 @@ from streaming_regime import (
     RollingTopHalfMean,
     StreamingJumpRatioProcessor,
     notebook_aligned_jump_ratio_processor,
-    run_jump_ratio_on_metric_rows,
     run_pipeline,
     run_processor_on_indexed_stream,
 )
@@ -142,7 +141,11 @@ def test_notebook_aligned_factory_and_metric_rows_roundtrip() -> None:
     proc = notebook_aligned_jump_ratio_processor(
         ewm_span=span, rolling_window=win, epsilon=eps
     )
-    steps, _ = run_jump_ratio_on_metric_rows(iter(rows), processor=proc)
+
+    # Mirror the old helper: use each row's ``frame`` as the index and
+    # ``laplacian_variance`` as the scalar fed into the processor.
+    indexed = ((int(r["frame"]), float(r["laplacian_variance"])) for r in rows)
+    steps, _ = run_processor_on_indexed_stream(indexed, proc)
     for step in steps:
         exp = expected.iloc[step.index]
         if exp != exp:

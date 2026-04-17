@@ -45,7 +45,7 @@ flowchart LR
 1. **Iterator of `(frame_no, frame_bgr)`** — same source as `find_last_proper_video_frame` (e.g. `get_image_iterator_from_file`).
 2. **`iter_frame_metrics_rows(iterator, fps)`** — yields one **dict per frame**; keys match the CSV written by `debug_csv` in `find_last_proper_video_frame`.
 3. **Scalar selection** — typically `laplacian_variance`; could be `mean`, `combined_entropy`, etc.
-4. **`run_jump_ratio_on_metric_rows`** (or `run_processor_on_indexed_stream`) — produce **`MetricStep`** objects with `jump_ratio` when the online numerator and baseline are both finite.
+4. **`run_processor_on_indexed_stream`** — produce **`MetricStep`** objects with `jump_ratio` when the online numerator and baseline are both finite.
 5. **`FinalRegimeBreakDetector`** — updates on each step; after the stream ends, **`result()`** is the **last** time the chosen value **crossed upward** above a threshold (see §6).
 
 ---
@@ -138,7 +138,7 @@ O(1) approximate exponentially weighted standard deviation: separate EWM on \(x\
 
 **`step(index, x) -> MetricStep`:** sets `numerator`, `baseline`, and `jump_ratio` when both estimates are finite; **`MetricStep.x`** is the **raw** `x` passed in (not the transformed value), so it stays comparable to the original stream.
 
-**`process(stream)`** uses indices `0..n-1` only; for real frame numbers use **`run_processor_on_indexed_stream`** or **`run_jump_ratio_on_metric_rows`**.
+**`process(stream)`** uses indices `0..n-1` only; for real frame numbers use **`run_processor_on_indexed_stream`**.
 
 ### 4.7 `MetricStep` and `MetricStepPipeline`
 
@@ -152,7 +152,6 @@ O(1) approximate exponentially weighted standard deviation: separate EWM on \(x\
 | **`notebook_aligned_jump_ratio_processor(ewm_span=50, rolling_window=50, epsilon=1e-5)`** | Returns a **`StreamingJumpRatioProcessor`** with **`RollingTopHalfMean(rolling_window)`** and **`EWMean(ewm_span)`** (pandas-aligned default). |
 | **`run_processor_on_indexed_stream(indexed_values, processor, detector=None)`** | `indexed_values` is `Iterator[tuple[int, float]]`; **`MetricStep.index`** is the provided index (e.g. CSV `frame`). |
 | **`run_pipeline(values, processor, detector=None)`** | Same as indexed stream with **`enumerate(values)`**. |
-| **`run_jump_ratio_on_metric_rows(rows, column="laplacian_variance", ...)`** | Consumes dict rows (e.g. from **`iter_frame_metrics_rows`**); builds **`(int(r["frame"]), float(r[column]))`** stream. |
 | **`iter_metrics_with_jump_ratios(rows, source_key="laplacian_variance", ...)`** | High-level convenience iterator: for each metrics row, yields the original fields plus short/long statistics and a jump-ratio column for the chosen metric. |
 
 ---

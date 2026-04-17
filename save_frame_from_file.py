@@ -156,20 +156,41 @@ def compute_frame_metrics_row(
 
 
 def iter_frame_metrics_rows(
-    # image_iterator: Iterator[tuple[int, np.ndarray]],
     image_iterator: Iterator[tuple[int, np.ndarray]],
     total_frames: int,
     fps: float,
+    *,
+    use_tqdm: bool = True,
 ) -> Iterator[dict[str, float | int]]:
     """
-    Yield metric dicts in CSV column order for each ``(frame_no, frame_bgr)`` from ``image_iterator``.
+    Yield metric dicts in CSV column order for each ``(frame_no, frame_bgr)``.
 
-    Maintains ``previous_bgr`` exactly like ``find_last_proper_video_frame``.
+    Parameters
+    ----------
+    image_iterator:
+        Iterator of ``(frame_no, frame_bgr)`` pairs.
+    total_frames:
+        Estimated total frame count for progress reporting.
+    fps:
+        Frames per second used to derive the ``timestamp`` metric.
+    use_tqdm:
+        When ``True`` (default), wrap the iterator in ``EtaTqdm`` for a
+        progress bar. Set to ``False`` when you want to control tqdm at a
+        higher level (e.g. in ``locate_noise``).
+
+    Notes
+    -----
+    This maintains ``previous_bgr`` exactly like
+    ``find_last_proper_video_frame``.
     """
     previous_bgr = None
-    for frame_no, frame_bgr in EtaTqdm(image_iterator, total=total_frames, desc="Processing frames"):
+    iterable = (
+        EtaTqdm(image_iterator, total=total_frames, desc="Processing frames")
+        if use_tqdm
+        else image_iterator
+    )
+    for frame_no, frame_bgr in iterable:
         metrics = compute_frame_metrics_row(frame_bgr, previous_bgr, frame_no, fps)
-        # print('metrics: ', metrics)
         yield metrics
         previous_bgr = frame_bgr
 

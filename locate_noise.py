@@ -2,13 +2,14 @@ import cv2
 import sys
 from save_frame_from_file import iter_frame_metrics_rows
 from streaming_regime import (
-    notebook_aligned_jump_ratio_processor,
     FinalRegimeBreakDetector,
-    run_jump_ratio_on_metric_rows,
+    iter_metrics_with_jump_ratios,
+    make_row_regime_break_detector,
 )
 from utils import get_frames_estimate
 from vidfile_iterator import get_frame_iterator_from_file, get_frames_from_iterator
 import pathlib
+from tqdm import tqdm
 
 def locate_noise(video_path):
     total_frames, fps = get_frames_estimate(video_path)
@@ -19,13 +20,19 @@ def locate_noise(video_path):
     # sum=0
     # for frame_no, frame_bgr in EtaTqdm(image_iterator, total=frames, desc="Processing frames"):
 
-    proc = notebook_aligned_jump_ratio_processor(ewm_span=50, rolling_window=50, epsilon=1e-5)
-    det = FinalRegimeBreakDetector(1.5)  # threshold on jump_ratio; tune for your data
-    # frames = get_image_iterator_from_file(video_path)
-    rows = iter_frame_metrics_rows(frames, total_frames, fps)
-    # rows_df = pd.DataFrame(rows)
-    steps, last_break = run_jump_ratio_on_metric_rows(rows, processor=proc, detector=det)
-    return last_break
+    # 1) Compute frame-level metrics (no inner tqdm here).
+    rows = iter_frame_metrics_rows(frames, total_frames, fps, use_tqdm=False)
+
+    # 2) Enrich rows with short/long stats + jump ratio on laplacian_variance.
+    enriched_rows = iter_metrics_with_jump_ratios(rows)
+
+    # 3) Track the last upward crossing of a jump-ratio threshold on those rows.
+    det = make_row_regime_break_detector(1.5, value_key="lap_jump_ratio", frame_key="frame")
+    pbar = tqdm(enriched_rows, total=total_frames, desc="Jump ratio")
+    for row in pbar:
+        det.consume(row)
+        pbar.set_description(f"Frame {row['frame']} - Jump Ratio: {row['lap_jump_ratio']}")
+    return det.result()
 
 if __name__ == "__main__":
     # read_save_frame_from_file() 

@@ -232,22 +232,34 @@ class StreamingJumpRatioProcessor:
 
 class FinalRegimeBreakDetector:
     """
-    Tracks the *last* upward crossing of a threshold on a scalar series extracted from
-    each step (default: ``jump_ratio``). "Upward" = current > threshold and previous <= threshold
+    Tracks the *last* upward crossing of a threshold on a scalar series.
+
+    The detector is agnostic to the exact sample type; by default it assumes
+    a :class:`MetricStep` and reads ``jump_ratio``, ``index`` and ``x`` from
+    that object. For other sample shapes (e.g. dict rows with a ``"jump_ratio"``
+    key), provide explicit getter functions.
+
+    "Upward" = current > threshold and previous <= threshold
     (missing previous counts as at/below).
 
-    Call ``consume`` for each ``MetricStep``, then ``result`` after the stream ends.
+    Call :meth:`consume` for each sample, then :meth:`result` after the stream
+    ends.
     """
 
     def __init__(
         self,
         threshold: float,
         *,
-        value_getter: Callable[[MetricStep], float | None] | None = None,
+        value_getter: Callable[[Any], float | None] | None = None,
+        index_getter: Callable[[Any], int] | None = None,
+        x_getter: Callable[[Any], float] | None = None,
         treat_initial_above_as_cross: bool = True,
     ) -> None:
         self._threshold = threshold
-        self._getter = value_getter or (lambda s: s.jump_ratio)
+        # Default getters assume MetricStep-like objects.
+        self._value_getter = value_getter or (lambda s: getattr(s, "jump_ratio", None))
+        self._index_getter = index_getter or (lambda s: int(getattr(s, "index", 0)))
+        self._x_getter = x_getter or (lambda s: float(getattr(s, "x", 0.0)))
         self._treat_initial = treat_initial_above_as_cross
         self.reset()
 
@@ -256,8 +268,10 @@ class FinalRegimeBreakDetector:
         self._prev_defined = False
         self._last_break: RegimeBreak | None = None
 
-    def consume(self, step: MetricStep) -> None:
-        val = self._getter(step)
+    def consume(self, sample: Any) -> None:
+        """Ingest one sample (MetricStep or row-like), updating the last break."""
+
+        val = self._value_getter(sample)
         if val is None or val != val:
             return
         if not self._prev_defined:
@@ -266,7 +280,9 @@ class FinalRegimeBreakDetector:
             prev_at_or_below = self._prev is not None and self._prev <= self._threshold
         crossed = val > self._threshold and prev_at_or_below
         if crossed:
-            self._last_break = RegimeBreak(index=step.index, x=step.x, value=val, step=step)
+            idx = self._index_getter(sample)
+            x_val = self._x_getter(sample)
+            self._last_break = RegimeBreak(index=idx, x=x_val, value=val, step=sample)
         self._prev = val
         self._prev_defined = True
 
@@ -285,6 +301,43 @@ class RegimeBreak:
     x: float
     value: float
     step: MetricStep
+
+
+def make_row_regime_break_detector(
+    threshold: float,
+    *,
+    value_key: str = "lap_jump_ratio",
+    frame_key: str = "frame",
+    treat_initial_above_as_cross: bool = True,
+) -> FinalRegimeBreakDetector:
+    """
+    Convenience constructor for ``FinalRegimeBreakDetector`` on dict-like rows.
+
+    The resulting detector expects to be fed metric rows (e.g. from
+    :func:`iter_metrics_with_jump_ratios`) and will read:
+
+    - ``row[value_key]`` as the scalar series (e.g. a jump ratio), and
+    - ``row[frame_key]`` as the index, if present.
+    """
+
+    def _value(row: MetricRow) -> float | None:
+        v = row.get(value_key)
+        return None if v is None else float(v)
+
+    def _index(row: MetricRow) -> int:
+        return int(row.get(frame_key, 0))
+
+    def _x(row: MetricRow) -> float:
+        v = row.get(value_key)
+        return float(v) if v is not None else float("nan")
+
+    return FinalRegimeBreakDetector(
+        threshold,
+        value_getter=_value,
+        index_getter=_index,
+        x_getter=_x,
+        treat_initial_above_as_cross=treat_initial_above_as_cross,
+    )
 
 
 # Collections of steps / results reused across the API.
@@ -347,26 +400,6 @@ def notebook_aligned_jump_ratio_processor(
         numerator=RollingTopHalfMean(rolling_window),
         baseline=EWMean(ewm_span),
         epsilon=epsilon,
-    )
-
-
-def run_jump_ratio_on_metric_rows(
-    rows: Iterator[MetricRow],
-    *,
-    column: str = "laplacian_variance",
-    processor: MetricStepPipeline | None = None,
-    detector: FinalRegimeBreakDetector | None = None,
-) -> MetricStepSeries:
-    """
-    Wire CSV-style metric dicts into the jump-ratio processor (streaming, no file).
-
-    Typical source: ``save_frame_from_file.iter_frame_metrics_rows(...)``.
-    """
-    proc = processor or notebook_aligned_jump_ratio_processor()
-    return run_processor_on_indexed_stream(
-        ((int(r["frame"]), float(r[column])) for r in rows),
-        proc,
-        detector,
     )
 
 
@@ -506,6 +539,24 @@ def iter_jump_ratio_from_stats(
         for row in jr_rows:
             print(row["frame"], row["jump_ratio"])
     """
+
+    for row in stats_rows:
+        out: MetricStatsRow = {}
+        if frame_key in row:
+            out[frame_key] = int(row[frame_key])
+
+        num = float(row[numerator_key])
+        den = float(row[baseline_key])
+        out[numerator_key] = num
+        out[baseline_key] = den
+
+        if num == num and den == den:  # both finite
+            jr = (epsilon + num) / (epsilon + den)
+        else:
+            jr = float("nan")
+        out["jump_ratio"] = jr
+
+        yield out
 
 
 def iter_metrics_with_jump_ratios(

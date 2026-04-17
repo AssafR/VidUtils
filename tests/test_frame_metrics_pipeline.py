@@ -16,7 +16,7 @@ from save_frame_from_file import (
 )
 from streaming_regime import (
     notebook_aligned_jump_ratio_processor,
-    run_jump_ratio_on_metric_rows,
+    run_processor_on_indexed_stream,
 )
 
 
@@ -95,7 +95,9 @@ def test_streaming_jump_ratio_matches_pandas_on_saved_csv() -> None:
     proc = notebook_aligned_jump_ratio_processor(
         ewm_span=span, rolling_window=window, epsilon=eps
     )
-    steps, _ = run_jump_ratio_on_metric_rows(iter(rows), processor=proc)
+
+    indexed = ((int(r["frame"]), float(r["laplacian_variance"])) for r in rows)
+    steps, _ = run_processor_on_indexed_stream(indexed, proc)
 
     assert len(steps) == len(df)
     for i, step in enumerate(steps):
