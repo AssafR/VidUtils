@@ -45,7 +45,7 @@ flowchart LR
 1. **Iterator of `(frame_no, frame_bgr)`** — same source as `find_last_proper_video_frame` (e.g. `get_image_iterator_from_file`).
 2. **`iter_frame_metrics_rows(iterator, fps)`** — yields one **dict per frame**; keys match the CSV written by `debug_csv` in `find_last_proper_video_frame`.
 3. **Scalar selection** — typically `laplacian_variance`; could be `mean`, `combined_entropy`, etc.
-4. **`run_jump_ratio_on_metric_rows`** / **`run_jump_ratio_on_metric_rows_multi`** (or `run_processor_on_indexed_stream`) — produce **`MetricStep`** objects with `jump_ratio` when the online numerator and baseline are both finite.
+4. **`run_jump_ratio_on_metric_rows`** (or `run_processor_on_indexed_stream`) — produce **`MetricStep`** objects with `jump_ratio` when the online numerator and baseline are both finite.
 5. **`FinalRegimeBreakDetector`** — updates on each step; after the stream ends, **`result()`** is the **last** time the chosen value **crossed upward** above a threshold (see §6).
 
 ---
@@ -140,10 +140,10 @@ O(1) approximate exponentially weighted standard deviation: separate EWM on \(x\
 
 **`process(stream)`** uses indices `0..n-1` only; for real frame numbers use **`run_processor_on_indexed_stream`** or **`run_jump_ratio_on_metric_rows`**.
 
-### 4.7 `MetricStep` and `MetricStepProcessor`
+### 4.7 `MetricStep` and `MetricStepPipeline`
 
 - **`MetricStep`**: `index`, `x`, optional `jump_ratio` / `numerator` / `baseline`, and **`extras`** for custom fields.
-- **`MetricStepProcessor`**: protocol for alternate processors with the same **`reset` / `step` / `process`** surface.
+- **`MetricStepPipeline`**: protocol for alternate pipelines with the same **`reset` / `step` / `process`** surface as `StreamingJumpRatioProcessor`.
 
 ### 4.8 Convenience builders
 
@@ -153,7 +153,7 @@ O(1) approximate exponentially weighted standard deviation: separate EWM on \(x\
 | **`run_processor_on_indexed_stream(indexed_values, processor, detector=None)`** | `indexed_values` is `Iterator[tuple[int, float]]`; **`MetricStep.index`** is the provided index (e.g. CSV `frame`). |
 | **`run_pipeline(values, processor, detector=None)`** | Same as indexed stream with **`enumerate(values)`**. |
 | **`run_jump_ratio_on_metric_rows(rows, column="laplacian_variance", ...)`** | Consumes dict rows (e.g. from **`iter_frame_metrics_rows`**); builds **`(int(r["frame"]), float(r[column]))`** stream. |
-| **`run_jump_ratio_on_metric_rows_multi(rows, columns=None, processor_factory=None, detector_factory=None)`** | Like `run_jump_ratio_on_metric_rows` but for **multiple numeric columns at once**; consumes the row iterator a single time and returns a mapping `column -> (steps, last_break)`. |
+| **`iter_metrics_with_jump_ratios(rows, source_key="laplacian_variance", ...)`** | High-level convenience iterator: for each metrics row, yields the original fields plus short/long statistics and a jump-ratio column for the chosen metric. |
 
 ---
 
@@ -255,23 +255,6 @@ for row in iter_frame_metrics_rows(get_image_iterator_from_file("clip.mp4"), fps
     if row["combined_entropy"] > some_limit:
         ...
 ```
-
-You can also run jump-ratio analysis on **several metrics in one pass** using `run_jump_ratio_on_metric_rows_multi`:
-
-```python
-from streaming_regime import run_jump_ratio_on_metric_rows_multi
-
-rows = iter_frame_metrics_rows(get_image_iterator_from_file("clip.mp4"), fps)
-results = run_jump_ratio_on_metric_rows_multi(
-    rows,
-    columns=["mean", "local_entropy", "laplacian_variance"],
-)
-
-mean_steps, mean_break = results["mean"]
-lap_steps, lap_break = results["laplacian_variance"]
-```
-
----
 
 ## 10. Automated tests
 

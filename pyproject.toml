@@ -13,8 +13,18 @@ dependencies = [
     "opencv-python>=4.13.0.92",
     "pandas>=3.0.2",
     "pillow>=12.2.0",
+    "pytest>=9.0.3",
     "scipy>=1.17.1",
     "tqdm>=4.67.3",
     "typing-extensions>=4.15.0",
     "vapoursynth>=74",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

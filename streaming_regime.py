@@ -9,9 +9,15 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator, Protocol, runtime_checkable
-
+from typing import Any, Callable, Iterator, Protocol, TypeAlias, runtime_checkable
 import numpy as np
+
+
+# ---- Shared type aliases -------------------------------------------------
+
+# One row of metrics or stats keyed by name.
+MetricRow: TypeAlias = dict[str, Any]
+MetricStatsRow: TypeAlias = dict[str, float | int]
 
 
 def ewm_alpha_from_span(span: float) -> float:
@@ -137,19 +143,37 @@ class RollingTopHalfMean:
 
 @dataclass
 class MetricStep:
-    """One time step through the streaming pipeline."""
+    """
+    Snapshot of all streaming jump-ratio state for a single time step.
 
+    This is the "rich" record returned by jump-ratio oriented helpers
+    (``StreamingJumpRatioProcessor``, ``run_pipeline``, etc.). For lighter
+    usage (e.g. just wanting updated stats as dicts), prefer the functional
+    iterators ``iter_online_stats`` and ``iter_jump_ratio_from_stats`` below.
+    """
+
+    #: Logical index of this sample (e.g. frame number from the metrics row).
     index: int
+    #: Raw scalar value fed into the processor for this step.
     x: float
+    #: Jump ratio at this step, when both numerator and baseline are finite.
     jump_ratio: float | None = None
+    #: Current value of the "short-range" / numerator statistic.
     numerator: float | None = None
+    #: Current value of the "long-range" / baseline statistic.
     baseline: float | None = None
+    #: Free-form storage for additional per-step values when experimenting.
     extras: dict[str, Any] = field(default_factory=dict)
 
 
 @runtime_checkable
-class MetricStepProcessor(Protocol):
-    """Implement for custom metrics; must match ``StreamingJumpRatioProcessor`` shape."""
+class MetricStepPipeline(Protocol):
+    """
+    Minimal interface for anything that turns a scalar stream into ``MetricStep``s.
+
+    ``StreamingJumpRatioProcessor`` implements this protocol; you can provide
+    your own pipelines as long as they expose the same surface.
+    """
 
     def reset(self) -> None: ...
 
@@ -160,10 +184,19 @@ class MetricStepProcessor(Protocol):
 
 class StreamingJumpRatioProcessor:
     """
-    For each raw sample ``x`` (optionally transformed), update numerator and baseline
-    estimators and emit ``(epsilon + num) / (epsilon + den)`` when both are finite.
+    High-level helper that ties together two ``OnlineStatistic`` objects
+    (numerator + baseline) into jump-ratio style ``MetricStep`` records.
 
-    Inject any ``OnlineStatistic`` implementations to experiment (EWM vs ring, etc.).
+    - For each incoming scalar ``x`` it optionally applies ``value_fn(x)``
+      (e.g. to scale or transform).
+    - It feeds that value into both the numerator and baseline statistics.
+    - It then produces a ``MetricStep`` carrying the raw ``x``, the two
+      updated statistics, and a ``jump_ratio`` field equal to
+      ``(epsilon + numerator) / (epsilon + baseline)`` when both are finite.
+
+    This class is convenient when you want an OO-style processor. If you
+    prefer a more "pipe and filter" functional style, see:
+    ``iter_online_stats`` + ``iter_jump_ratio_from_stats``.
     """
 
     def __init__(
@@ -254,11 +287,15 @@ class RegimeBreak:
     step: MetricStep
 
 
+# Collections of steps / results reused across the API.
+MetricStepSeries: TypeAlias = tuple[list[MetricStep], RegimeBreak | None]
+
+
 def run_processor_on_indexed_stream(
     indexed_values: Iterator[tuple[int, float]],
-    processor: MetricStepProcessor,
+    processor: MetricStepPipeline,
     detector: FinalRegimeBreakDetector | None = None,
-) -> tuple[list[MetricStep], RegimeBreak | None]:
+) -> MetricStepSeries:
     """
     Like ``run_pipeline`` but each sample carries its own index (e.g. video frame number).
 
@@ -280,9 +317,9 @@ def run_processor_on_indexed_stream(
 
 def run_pipeline(
     values: Iterator[float],
-    processor: MetricStepProcessor,
+    processor: MetricStepPipeline,
     detector: FinalRegimeBreakDetector | None = None,
-) -> tuple[list[MetricStep], RegimeBreak | None]:
+) -> MetricStepSeries:
     """
     Consume a stream: collect all steps and optionally track final regime break.
 
@@ -314,12 +351,12 @@ def notebook_aligned_jump_ratio_processor(
 
 
 def run_jump_ratio_on_metric_rows(
-    rows: Iterator[dict[str, Any]],
+    rows: Iterator[MetricRow],
     *,
     column: str = "laplacian_variance",
-    processor: MetricStepProcessor | None = None,
+    processor: MetricStepPipeline | None = None,
     detector: FinalRegimeBreakDetector | None = None,
-) -> tuple[list[MetricStep], RegimeBreak | None]:
+) -> MetricStepSeries:
     """
     Wire CSV-style metric dicts into the jump-ratio processor (streaming, no file).
 
@@ -333,97 +370,222 @@ def run_jump_ratio_on_metric_rows(
     )
 
 
-def run_jump_ratio_on_metric_rows_multi(
-    rows: Iterator[dict[str, Any]],
+def iter_online_stats(
+    rows: Iterator[MetricRow],
     *,
-    columns: list[str] | None = None,
-    processor_factory: Callable[[str], MetricStepProcessor] | None = None,
-    detector_factory: Callable[[str], FinalRegimeBreakDetector | None] | None = None,
-) -> dict[str, tuple[list[MetricStep], RegimeBreak | None]]:
+    specs: dict[str, tuple[str, OnlineStatistic]],
+    frame_key: str = "frame",
+) -> Iterator[MetricStatsRow]:
     """
-    Run the jump-ratio processor on **multiple numeric columns** from the same metric rows stream.
-
-    This lets you consume rows (e.g. from ``iter_frame_metrics_rows``) **once** and
-    compute jump-ratios for several fields in a single streaming pass.
+    Stream online statistics for multiple fields from a dict-row iterator.
 
     Parameters
     ----------
     rows:
-        Iterator of dict-like metric rows. Each row must contain a ``"frame"`` key
-        plus one or more numeric columns.
-    columns:
-        Optional explicit list of column names to process. If ``None``, the
-        columns are inferred from the first row as all numeric keys except ``"frame"``.
-    processor_factory:
-        Optional factory ``factory(column_name) -> MetricStepProcessor``.
-        Defaults to ``notebook_aligned_jump_ratio_processor`` for every column.
-    detector_factory:
-        Optional factory ``factory(column_name) -> FinalRegimeBreakDetector | None``
-        to attach independent regime-break detectors per column. If omitted,
-        no detectors are used.
+        Iterator of input rows, typically from ``iter_frame_metrics_rows``.
+    specs:
+        Mapping ``output_name -> (source_key, OnlineStatistic)``.
+        For each output name, the given ``OnlineStatistic`` is updated using
+        ``row[source_key]`` on every step.
+    frame_key:
+        Optional key in the input rows that carries the frame/index value
+        (default: ``"frame"``). When present, it is copied through to the
+        output rows as an ``int``.
 
-    Returns
-    -------
-    dict[str, tuple[list[MetricStep], RegimeBreak | None]]:
-        Mapping ``column_name -> (steps, last_break)`` mirroring
-        ``run_jump_ratio_on_metric_rows`` for each processed column.
+    Yields
+    ------
+    dict[str, float | int]
+        For each input row, a dict containing:
+        - ``frame_key`` (if present in the input row), and
+        - one entry per ``output_name`` in ``specs``, holding the current
+          statistic value after ingesting that row.
+
+    Examples
+    --------
+    Basic usage with frame metric rows::
+
+        from save_frame_from_file import iter_frame_metrics_rows
+        from streaming_regime import EWMean, RollingTopHalfMean, iter_online_stats
+
+        rows = iter_frame_metrics_rows(image_iterator, total_frames=total_frames, fps=fps)
+        specs = {
+            "lap_short": ("laplacian_variance", RollingTopHalfMean(window=50)),
+            "lap_long":  ("laplacian_variance", EWMean(span=50)),
+        }
+
+        for stats_row in iter_online_stats(rows, specs=specs):
+            print(stats_row["frame"], stats_row["lap_short"], stats_row["lap_long"])
+
+    The same iterator can be materialized into a DataFrame instead of being
+    consumed online::
+
+        import pandas as pd
+
+        df_stats = pd.DataFrame(iter_online_stats(rows, specs=specs))
+
+    This function is intentionally generic and readable: you can feed its
+    output into jump-ratio analysis, logging, plotting, or any other
+    downstream logic.
     """
 
-    try:
-        first_row = next(rows)
-    except StopIteration:
-        return {}
+    # Reset all statistics before streaming.
+    for _out_name, (_src_key, stat) in specs.items():
+        stat.reset()
 
-    # Infer default columns from the first row if not provided.
-    if columns is None:
-        inferred: list[str] = []
-        for k, v in first_row.items():
-            if k == "frame":
-                continue
-            # Treat ints / floats (including numpy scalars) as numeric.
-            if isinstance(v, (int, float, np.floating, np.integer)):
-                inferred.append(k)
-        columns = inferred
-
-    if not columns:
-        return {}
-
-    proc_factory = processor_factory or (lambda _col: notebook_aligned_jump_ratio_processor())
-    det_factory = detector_factory or (lambda _col: None)
-
-    processors: dict[str, MetricStepProcessor] = {col: proc_factory(col) for col in columns}
-    detectors: dict[str, FinalRegimeBreakDetector | None] = {
-        col: det_factory(col) for col in columns
-    }
-
-    # Reset all processors / detectors before streaming.
-    for p in processors.values():
-        p.reset()
-    for d in detectors.values():
-        if d is not None:
-            d.reset()
-
-    steps_by_col: dict[str, list[MetricStep]] = {col: [] for col in columns}
-
-    def _consume_row(row: dict[str, Any]) -> None:
-        idx = int(row["frame"])
-        for col in columns or ():
-            val = float(row[col])
-            step = processors[col].step(idx, val)
-            steps_by_col[col].append(step)
-            det = detectors[col]
-            if det is not None:
-                det.consume(step)
-
-    # Feed the first row we already pulled for inference, then the rest.
-    _consume_row(first_row)
     for row in rows:
-        _consume_row(row)
+        metrics_out: MetricStatsRow = {}
+        if frame_key in row:
+            metrics_out[frame_key] = int(row[frame_key])
+        for out_name, (src_key, stat) in specs.items():
+            value = float(row[src_key])
+            metrics_out[out_name] = stat.update(value)
+        yield metrics_out
 
-    results: dict[str, tuple[list[MetricStep], RegimeBreak | None]] = {}
-    for col in columns:
-        det = detectors[col]
-        last_break = det.result() if det is not None else None
-        results[col] = (steps_by_col[col], last_break)
 
-    return results
+def iter_jump_ratio_from_stats(
+    stats_rows: Iterator[MetricStatsRow],
+    *,
+    frame_key: str = "frame",
+    numerator_key: str,
+    baseline_key: str,
+    epsilon: float = 1e-5,
+) -> Iterator[MetricStatsRow]:
+    """
+    Compute a jump ratio from a stream of stats dicts.
+
+    This is a thin, readable layer over the core jump-ratio definition:
+    for each row, it takes ``numerator_key`` and ``baseline_key`` from the
+    stats dict and emits a new dict with a ``"jump_ratio"`` field.
+
+    Parameters
+    ----------
+    stats_rows:
+        Iterator of stats dicts, e.g. produced by ``iter_online_stats``.
+    frame_key:
+        Optional key that carries the frame/index value (default: ``"frame"``).
+        When present, it is copied through to each output row.
+    numerator_key, baseline_key:
+        Keys in each stats row that provide the numerator and baseline values.
+    epsilon:
+        Small stabilizer added to numerator and baseline to avoid division by
+        zero (default: ``1e-5``).
+
+    Yields
+    ------
+    dict[str, float | int]
+        For each stats row, a dict containing:
+        - ``frame_key`` (if present),
+        - the raw numerator and baseline values under their original keys, and
+        - a ``"jump_ratio"`` field.
+
+    Examples
+    --------
+    Combine with ``iter_online_stats`` to compute jump ratios in a second
+    streaming pass::
+
+        from streaming_regime import (
+            EWMean,
+            RollingTopHalfMean,
+            iter_online_stats,
+            iter_jump_ratio_from_stats,
+        )
+
+        rows = iter_frame_metrics_rows(image_iterator, total_frames=total_frames, fps=fps)
+        specs = {
+            "lap_short": ("laplacian_variance", RollingTopHalfMean(window=50)),
+            "lap_long":  ("laplacian_variance", EWMean(span=50)),
+        }
+
+        stats_rows = iter_online_stats(rows, specs=specs)
+        jr_rows = iter_jump_ratio_from_stats(
+            stats_rows,
+            numerator_key="lap_short",
+            baseline_key="lap_long",
+        )
+
+        for row in jr_rows:
+            print(row["frame"], row["jump_ratio"])
+    """
+
+
+def iter_metrics_with_jump_ratios(
+    rows: Iterator[MetricRow],
+    *,
+    source_key: str = "laplacian_variance",
+    short_name: str = "lap_short",
+    long_name: str = "lap_long",
+    jump_name: str = "lap_jump_ratio",
+    ewm_span: float = 50,
+    rolling_window: int = 50,
+    epsilon: float = 1e-5,
+) -> Iterator[MetricRow]:
+        
+    """ 
+    Convenience iterator: original metric rows + online jump-ratio columns.
+
+    For each incoming metrics row (e.g. from ``iter_frame_metrics_rows``),
+    this function:
+
+    - reads ``row[source_key]``,
+    - maintains a short-range statistic (rolling top-half mean) and a
+      long-range statistic (EWM) on that value, and
+    - yields a new dict that contains all original keys plus:
+
+      - ``short_name``: current short-range statistic,
+      - ``long_name``: current long-range statistic,
+      - ``jump_name``: jump ratio
+        ``(epsilon + short_name) / (epsilon + long_name)`` when both are finite,
+        or ``nan`` otherwise.
+
+    Parameters
+    ----------
+    rows:
+        Iterator of metric rows, typically from ``iter_frame_metrics_rows``.
+    source_key:
+        Key in each row that provides the scalar to analyse (default:
+        ``"laplacian_variance"``).
+    short_name, long_name, jump_name:
+        Column names to attach to each output row for the short/long
+        statistics and the resulting jump ratio.
+    ewm_span, rolling_window, epsilon:
+        Parameters forwarded to the underlying EWM and rolling top-half
+        implementations and the jump-ratio definition.
+
+    Yields
+    ------
+    dict[str, Any]
+        For each input row, a shallow copy containing all original keys plus
+        the three additional jump-ratio related columns.
+
+    Notes
+    -----
+    This is equivalent in spirit to wiring ``rows`` through
+    ``iter_online_stats`` and then ``iter_jump_ratio_from_stats``, but keeps
+    the public surface very simple: a single enriched iterator that you can
+    consume online or materialize into a DataFrame.
+    """
+
+    short_stat = RollingTopHalfMean(rolling_window)
+    long_stat = EWMean(ewm_span)
+
+    short_stat.reset()
+    long_stat.reset()
+
+    for row in rows:
+        # Shallow copy so callers can keep using the original row if they want.
+        out: MetricRow = dict(row)
+
+        value = float(row[source_key])
+        short_val = short_stat.update(value)
+        long_val = long_stat.update(value)
+
+        out[short_name] = short_val
+        out[long_name] = long_val
+
+        if short_val == short_val and long_val == long_val:
+            jr = (epsilon + short_val) / (epsilon + long_val)
+        else:
+            jr = float("nan")
+        out[jump_name] = jr
+
+        yield out
