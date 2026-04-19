@@ -141,6 +141,41 @@ class RollingTopHalfMean:
         return float(np.mean(np.partition(arr, -k)[-k:]))
 
 
+class RollingPercentile:
+    """
+    Rolling sample percentile over a fixed-size window.
+
+    This is a generalization of rolling extrema:
+
+    - ``q = 0.0`` → rolling minimum
+    - ``q = 1.0`` → rolling maximum
+    - ``q = 0.1`` → rolling 10th percentile, etc.
+
+    Memory is O(window). The estimate is exact for the window contents.
+    """
+
+    def __init__(self, window: int, q: float, min_periods: int | None = None) -> None:
+        if window < 1:
+            raise ValueError("window must be >= 1")
+        if not (0.0 <= q <= 1.0):
+            raise ValueError("q must be between 0 and 1")
+        self._window = window
+        self._q = q
+        self._min = window if min_periods is None else min_periods
+        self._buf: deque[float] = deque(maxlen=window)
+
+    def reset(self) -> None:
+        self._buf.clear()
+
+    def update(self, x: float) -> float:
+        self._buf.append(float(x))
+        n = len(self._buf)
+        if n < self._min:
+            return float("nan")
+        arr = np.asarray(self._buf, dtype=np.float64)
+        return float(np.quantile(arr, self._q))
+
+
 @dataclass
 class MetricStep:
     """
@@ -562,15 +597,17 @@ def iter_jump_ratio_from_stats(
 def iter_metrics_with_jump_ratios(
     rows: Iterator[MetricRow],
     *,
+    numerator_mode: str = "top_half",
     source_key: str = "laplacian_variance",
-    short_name: str = "lap_short",
-    long_name: str = "lap_long",
-    jump_name: str = "lap_jump_ratio",
-    ewm_span: float = 50,
+    short_name: str = None,
+    long_name: str = None,
+    jump_name: str = None,
+    ewm_span: float = 1000,
     rolling_window: int = 50,
     epsilon: float = 1e-5,
+    percentile_q: float = 0.75,
 ) -> Iterator[MetricRow]:
-        
+
     """ 
     Convenience iterator: original metric rows + online jump-ratio columns.
 
@@ -616,8 +653,18 @@ def iter_metrics_with_jump_ratios(
     consume online or materialize into a DataFrame.
     """
 
-    short_stat = RollingTopHalfMean(rolling_window)
-    long_stat = EWMean(ewm_span)
+    short_name: str = short_name or f"{source_key}_short"
+    long_name: str = long_name or f"{source_key}_long"
+    jump_name: str = jump_name or f"{source_key}_jump_ratio"
+
+    if numerator_mode == "top_half":
+        short_stat: OnlineStatistic = RollingTopHalfMean(rolling_window)
+    elif numerator_mode == "percentile":
+        short_stat = RollingPercentile(rolling_window, q=percentile_q)
+    else:
+        raise ValueError(f"Unsupported numerator_mode {numerator_mode!r}")
+
+    long_stat = EWMean(ewm_span, adjust=False)
 
     short_stat.reset()
     long_stat.reset()

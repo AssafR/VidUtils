@@ -1,7 +1,14 @@
 import av
 import matplotlib.pyplot as plt
 from typing import List, Iterator
-from vidfile_iterator import decode_all_packets_with_flush, packet_data_iterator_iterator,decode_packet_to_frames_with_state, frame_list_type
+import math
+from vidfile_iterator import (
+    FileFrameIterator,
+    decode_all_packets_with_flush,
+    packet_data_iterator_iterator,
+    decode_packet_to_frames_with_state,
+    frame_list_type,
+)
 import random
 
 
@@ -51,26 +58,43 @@ def display_thumbnail_grid(all_thumbs: List[List], labels: List[str], thumbs_per
     if not all_thumbs:
         print("No thumbnails to display")
         return
-    
-    rows = len(all_thumbs)
-    if rows > 0:
-        fig, axes = plt.subplots(rows, thumbs_per_row, figsize=(thumbs_per_row * 1.5, rows * 1.5))
-        fig.suptitle(title, fontsize=16)
 
-        for i, row_thumbs in enumerate(all_thumbs):
-            for j in range(thumbs_per_row):
-                ax = axes[i, j] if rows > 1 else axes[j]
-                ax.axis('off')
-                if j == 0:
-                    ax.set_title(labels[i], fontsize=10, loc='left')
-                if j < len(row_thumbs):
-                    ax.imshow(row_thumbs[j])
-
-        plt.tight_layout()
-        plt.subplots_adjust(top=0.9)
-        plt.show()
-    else:
+    # Flatten all thumbnail rows into a single sequence so that
+    # ``thumbs_per_row`` truly controls the grid width.
+    flat_thumbs = [thumb for row in all_thumbs for thumb in row]
+    total = len(flat_thumbs)
+    if total == 0:
         print("No thumbnails to display")
+        return
+
+    cols = max(1, thumbs_per_row)
+    rows = math.ceil(total / cols)
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.5, rows * 1.5))
+    fig.suptitle(title, fontsize=16)
+
+    # Normalize axes indexing for rows==1 / cols==1 cases.
+    if rows == 1 and cols == 1:
+        axes_grid = [[axes]]
+    elif rows == 1:
+        axes_grid = [axes]
+    elif cols == 1:
+        axes_grid = [[ax] for ax in axes]
+    else:
+        axes_grid = axes
+
+    for idx in range(rows * cols):
+        r = idx // cols
+        c = idx % cols
+        ax = axes_grid[r][c]
+        ax.axis("off")
+
+        if idx < total:
+            ax.imshow(flat_thumbs[idx])
+
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.9)
+    plt.show()
 
 
 def convert_frames_to_thumbnails(frames: List, downsample_factor: int = 4) -> List:
@@ -147,7 +171,10 @@ def process_frame_group_for_display(frames: List, chunk: List, group_index: int,
     return thumbs, label
 
 
-def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_per_row: int = 10, sampling_strategy: str = "first"):
+def display_thumbnails_from_frames(
+    frame_groups: List[frame_list_type], 
+    thumbs_per_row: int = 10, 
+    sampling_strategy: str = "first"):
     """
     Display thumbnails from a list of frame groups.
     Each group is a list of frames that were decoded together.
@@ -192,3 +219,86 @@ def display_thumbnails_from_frames(frame_groups: List[frame_list_type], thumbs_p
     # Display thumbnails using the extracted function
     title = f"Thumbnails ({sampling_strategy.capitalize()} Sampling)"
     display_thumbnail_grid(all_thumbs, labels, thumbs_per_row, title)
+
+
+def load_frame_window_around_index(
+    filename: str,
+    center_index: int,
+    k: int,
+) -> frame_list_type:
+    """
+    Load a contiguous window of frames ``[center_index-k, center_index+k]`` from a file.
+
+    This uses the existing ``FileFrameIterator`` and scans frames in order,
+    stopping once it has passed ``center_index + k``.
+
+    Parameters
+    ----------
+    filename:
+        Path to the video file.
+    center_index:
+        Central frame index (0-based).
+    k:
+        Number of frames before and after the center to include.
+
+    Returns
+    -------
+    frame_list_type
+        List of ``av.VideoFrame`` objects for the requested window. If the file
+        ends before ``center_index + k``, the list will be shorter.
+    """
+    start = max(0, center_index - k)
+    end = center_index + k
+
+    it = FileFrameIterator(filename)
+    window: frame_list_type = []
+    try:
+        for _packet_no, frame_no, frame in it.frame_iterator:
+            if frame_no < start:
+                continue
+            if frame_no > end:
+                break
+            window.append(frame)
+    finally:
+        it.close()
+
+    return window
+
+
+def display_frame_window_around_index(
+    filename: str,
+    center_index: int,
+    k: int,
+    thumbs_per_row: int | None = None,
+) -> None:
+    """
+    Display a grid of thumbnails for frames ``[center_index-k, center_index+k]``.
+
+    This is a convenience wrapper around ``load_frame_window_around_index`` and
+    ``display_thumbnails_from_frames``.
+
+    Parameters
+    ----------
+    filename:
+        Path to the video file.
+    center_index:
+        Central frame index (0-based).
+    k:
+        Number of frames before and after the center to include.
+    thumbs_per_row:
+        Optional override for thumbnails per row. Defaults to the number of
+        frames in the window (single-row layout).
+    """
+    window = load_frame_window_around_index(filename, center_index, k)
+    if not window:
+        print("No frames loaded for the requested window.")
+        return
+
+    per_row = thumbs_per_row or len(window)
+
+    # For this focused use case we want to display *all* frames in the
+    # window, not just a sampled subset. Convert directly to thumbnails
+    # and pass them to the generic grid helper.
+    thumbs = convert_frames_to_thumbnails(window)
+    title = f"Frames {center_index - k}..{center_index + k} around {center_index}"
+    display_thumbnail_grid([thumbs], labels=[title], thumbs_per_row=per_row, title=title)
