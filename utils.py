@@ -147,3 +147,39 @@ class EtaTqdm(tqdm):
             self._compute_eta()
             super().set_postfix(self._combined_postfix(), refresh=False)
             yield item
+
+def robust_scale_from_baseline(X, n_baseline=1000, eps=1e-9):
+    """
+    Robustly scale multivariate time-series features using
+    only an initial baseline segment.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Shape: (num_samples, num_features)
+
+    n_baseline : int
+        Number of initial samples used as the baseline.
+
+    eps : float
+        Small constant to avoid division by zero.
+
+    Returns
+    -------
+    X_scaled : np.ndarray
+        Robustly scaled array with same shape as X.
+    """
+
+    baseline = X[:n_baseline]
+
+    median = np.median(baseline, axis=0)
+
+    q75 = np.percentile(baseline, 75, axis=0)
+    q25 = np.percentile(baseline, 25, axis=0)
+
+    iqr = q75 - q25
+
+    X_scaled = (X - median) / (iqr + eps)
+
+    return X_scaled            
+

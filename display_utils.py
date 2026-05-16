@@ -225,12 +225,14 @@ def load_frame_window_around_index(
     filename: str,
     center_index: int,
     k: int,
+    fps: float | None = None,
 ) -> frame_list_type:
     """
     Load a contiguous window of frames ``[center_index-k, center_index+k]`` from a file.
 
-    This uses the existing ``FileFrameIterator`` and scans frames in order,
-    stopping once it has passed ``center_index + k``.
+    When ``fps`` is provided, this uses PyAV seeking based on timestamps to avoid
+    decoding the entire file for windows near the end. When ``fps`` is None,
+    it falls back to a simple sequential scan using ``FileFrameIterator``.
 
     Parameters
     ----------
@@ -240,6 +242,9 @@ def load_frame_window_around_index(
         Central frame index (0-based).
     k:
         Number of frames before and after the center to include.
+    fps:
+        Frames per second. When provided, enables approximate random access via
+        timestamp-based seeking; otherwise a full sequential scan is used.
 
     Returns
     -------
@@ -250,6 +255,35 @@ def load_frame_window_around_index(
     start = max(0, center_index - k)
     end = center_index + k
 
+    # Fast path: approximate random access via timestamp when fps is known.
+    if fps is not None and fps > 0:
+        container = av.open(filename, mode="r")
+        stream = container.streams.video[0]
+        time_base = stream.time_base or 1 / 25.0
+
+        center_time = center_index / fps
+        start_time = max(0.0, center_time - k / fps)
+        end_time = center_time + k / fps
+
+        start_pts = int(start_time / time_base)
+        end_pts = int(end_time / time_base)
+
+        frames: frame_list_type = []
+        try:
+            container.seek(start_pts, any_frame=False, backward=True, stream=stream)
+
+            for packet in container.demux(stream):
+                if packet.pts is None:
+                    continue
+                if packet.pts > end_pts:
+                    break
+                for frame in packet.decode():
+                    frames.append(frame)
+            return frames
+        finally:
+            container.close()
+
+    # Fallback: sequential scan using FileFrameIterator when fps is unknown.
     it = FileFrameIterator(filename)
     window: frame_list_type = []
     try:
@@ -270,6 +304,7 @@ def display_frame_window_around_index(
     center_index: int,
     k: int,
     thumbs_per_row: int | None = None,
+    fps: float | None = None,
 ) -> None:
     """
     Display a grid of thumbnails for frames ``[center_index-k, center_index+k]``.
@@ -288,8 +323,12 @@ def display_frame_window_around_index(
     thumbs_per_row:
         Optional override for thumbnails per row. Defaults to the number of
         frames in the window (single-row layout).
+    fps:
+        Frames per second for ``filename``. When provided, enables approximate
+        random access via timestamp-based seeking in
+        :func:`load_frame_window_around_index`.
     """
-    window = load_frame_window_around_index(filename, center_index, k)
+    window = load_frame_window_around_index(filename, center_index, k, fps=fps)
     if not window:
         print("No frames loaded for the requested window.")
         return
@@ -300,5 +339,21 @@ def display_frame_window_around_index(
     # window, not just a sampled subset. Convert directly to thumbnails
     # and pass them to the generic grid helper.
     thumbs = convert_frames_to_thumbnails(window)
-    title = f"Frames {center_index - k}..{center_index + k} around {center_index}"
+
+    # Highlight the exact center frame with a red border, if present.
+    start_index = max(0, center_index - k)
+    center_pos = center_index - start_index  # index within the window list
+    if 0 <= center_pos < len(thumbs):
+        thumb = thumbs[center_pos]
+        try:
+            border = 10  # thickness in pixels
+            thumb[:border, :, :] = [255, 0, 0]        # top
+            thumb[-border:, :, :] = [255, 0, 0]       # bottom
+            thumb[:, :border, :] = [255, 0, 0]        # left
+            thumb[:, -border:, :] = [255, 0, 0]       # right
+        except Exception:
+            # If anything goes wrong, skip highlighting without failing display.
+            print(f"Error highlighting center frame: {e}")
+            pass
+    title = f"Frames {center_index - k}..{center_index + k} around {center_index} (Center Frame Highlighted)"
     display_thumbnail_grid([thumbs], labels=[title], thumbs_per_row=per_row, title=title)

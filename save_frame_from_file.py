@@ -37,7 +37,6 @@ def calculate_temporal_entropy(current_gray, previous_gray):
     diff = cv2.absdiff(current_gray, previous_gray)
     return _compute_entropy(diff)
 
-
 def calculate_edge_density(gray, threshold=50):
     """Calculate the proportion of edges/high-frequency content in the frame."""
     edges = cv2.Canny(gray, threshold//2, threshold)
@@ -45,9 +44,92 @@ def calculate_edge_density(gray, threshold=50):
     total_pixels = edges.size
     return edge_pixels / total_pixels
 
+def calculate_darkness_ratio(gray, pixel_threshold=40):
+    gray = gray.astype(np.float32)
+
+    mean = gray.mean()
+    std = gray.std()
+    dark_ratio = np.mean(gray < pixel_threshold)
+
+    # high = likely black
+    return dark_ratio / (1.0 + std / 10.0)
+
 def calculate_histogram_entropy(gray):
     """Calculate entropy of the raw pixel value histogram (measures image variability)."""
     return _compute_entropy(gray)
+
+
+def calculate_fft_highband_ratio(gray, cutoff_ratio=0.25):
+    """
+    Measure proportion of spectral energy in high frequencies.
+
+    Parameters
+    ----------
+    gray : np.ndarray
+        Grayscale image (2D).
+        
+    cutoff_ratio : float
+        Radius threshold as fraction of image size.
+        Frequencies beyond this radius are considered "high".
+
+    Returns
+    -------
+    float
+        High-frequency energy ratio.
+    """
+
+    # Convert to float
+
+    gray_small  = cv2.resize(gray, (128, 96))
+    gray = gray_small.astype(np.float32)
+
+    # gray = gray.astype(np.float32)
+
+    # Optional but recommended:
+    # remove DC bias (average brightness)
+    gray = gray - np.mean(gray)
+
+    # 2D FFT
+    fft = np.fft.fft2(gray)
+
+    # Shift low frequencies to center
+    fft_shifted = np.fft.fftshift(fft)
+
+    # Power spectrum
+    magnitude = np.abs(fft_shifted) ** 2
+
+    h, w = gray.shape
+    cy, cx = h // 2, w // 2
+
+    # Distance-from-center map
+    y, x = np.ogrid[:h, :w]
+    distance = np.sqrt((x - cx)**2 + (y - cy)**2)
+
+    # Radius threshold
+    cutoff = min(h, w) * cutoff_ratio
+
+    # High-frequency mask
+    high_mask = distance >= cutoff
+
+    # Energy calculations
+    high_energy = magnitude[high_mask].sum()
+    total_energy = magnitude.sum()
+
+    # Avoid division by zero
+    if total_energy == 0:
+        return 0.0
+
+    return high_energy / total_energy
+
+def calculate_temporal_fft_highband_ratio(current_gray, previous_gray):
+    """Calculate the high-frequency energy ratio of the difference from the previous frame (temporal noise detection)."""
+    if previous_gray is None:
+        return 0.0
+    diff = cv2.absdiff(current_gray, previous_gray)
+    return calculate_fft_highband_ratio(diff)
+
+
+
 
 
 def is_proper_frame(frame_bgr, previous_bgr=None, mean_threshold=50.0, local_entropy_threshold=5.0, temporal_entropy_weight=0.3):
@@ -69,11 +151,15 @@ functions_to_calculate_metrics_dict = {
     "frame": lambda **kwargs: kwargs["frame_no"],
     "mean": lambda **kwargs: np.mean(kwargs["frame_bgr"]),
     "local_entropy": lambda **kwargs: calculate_local_entropy(kwargs["frame_bgr"]),
-    # "temporal_entropy": lambda **kwargs: calculate_temporal_entropy(kwargs["current_gray"], kwargs["previous_gray"]),
+    "darkness_ratio": lambda **kwargs: calculate_darkness_ratio(kwargs["frame_bgr"]),
     # "edge_density": lambda **kwargs: calculate_edge_density(kwargs["gray_for_edges"]),
     # "hist_entropy": lambda **kwargs: calculate_histogram_entropy(kwargs["gray_for_edges"]),
+    # "temporal_entropy": lambda **kwargs: calculate_temporal_entropy(kwargs["current_gray"], kwargs["previous_gray"]),
     "laplacian_variance": lambda **kwargs: calculate_laplacian_variance(kwargs["gray_for_edges"]),
-}
+    "fft_highband_ratio": lambda **kwargs: calculate_fft_highband_ratio(kwargs["gray_for_edges"]),
+    "temporal_fft_highband_ratio": lambda **kwargs: calculate_temporal_fft_highband_ratio(kwargs["current_gray"], kwargs["previous_gray"])
+    }
+    
 
 def compute_frame_metrics_row(
     frame_bgr: np.ndarray,
