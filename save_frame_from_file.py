@@ -1,7 +1,9 @@
+import os
 import sys
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 import cv2
 import numpy as np
+from PIL import Image
 from tqdm import tqdm
 from utils import WindowClosed, WindowManager, get_frames_estimate
 from vidfile_iterator import (FileFrameIterator, iterate_frames_from_packet_stream, 
@@ -11,6 +13,8 @@ from utils import calculate_mse_between_frames, _compute_entropy, EtaTqdm
 
 
 RESIZE_DIM_FOR_MSE = (64, 64)  # Resize dimensions for MSE calculation
+BLUE_HSV_LOWER = np.array([90, 70, 40], dtype=np.uint8)
+BLUE_HSV_UPPER = np.array([130, 255, 255], dtype=np.uint8)
 
 # Weights for ``combined_entropy`` in CSV / ``find_last_proper_video_frame`` (must match each other).
 FRAME_METRICS_COMBINED_LOCAL_WEIGHT = 0.7
@@ -36,6 +40,20 @@ def calculate_temporal_entropy(current_gray, previous_gray):
         return 0.0
     diff = cv2.absdiff(current_gray, previous_gray)
     return _compute_entropy(diff)
+
+
+def calculate_blue_screen_distance(
+    frame_bgr: np.ndarray, _reference_bgr: np.ndarray | None = None
+) -> float:
+    """Return the fraction of pixels not recognized as blue (0 = all blue, 1 = no blue).
+
+    The blue range is defined in OpenCV HSV coordinates. Saturation and value
+    minimums exclude gray and very dark pixels from counting as blue.
+    """
+    frame_hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    blue_mask = cv2.inRange(frame_hsv, BLUE_HSV_LOWER, BLUE_HSV_UPPER)
+    blue_fraction = np.count_nonzero(blue_mask) / blue_mask.size
+    return float(1.0 - blue_fraction)
 
 def calculate_edge_density(gray, threshold=50):
     """Calculate the proportion of edges/high-frequency content in the frame."""
@@ -379,36 +397,269 @@ def _save_metrics_csv(filepath, metrics_list):
 
 
 
-def find_first_dissimilar_frame(video_file, reference_image_path, min_frame=0, mse_threshold=1000.0):
+def find_first_dissimilar_frame(
+    video_file,
+    reference_image_path: str | os.PathLike[str] | Image.Image,
+    min_frame: int = 0,
+    mse_threshold: float = 1000.0,
+    distance_method: Callable[[np.ndarray, np.ndarray], float] = calculate_mse_between_frames,
+    with_time: bool = False,
+):
     """
     Pipeline to find the first frame after min_frame that is not similar to the reference image.
+
+    With ``with_time=True`` the result is ``(frame_no, frame_image, time_s)``
+    (``(None, None, None)`` if not found), where ``time_s`` is the frame's real
+    presentation time in seconds from the stream's time base.
     
     Args:
         video_file: Path to the video file
-        reference_image_path: Path to the reference image (e.g., 'saved_frame_6.jpg')
+        reference_image_path: Path to a reference image or a PIL image
         min_frame: Minimum frame number to start checking from
-        mse_threshold: MSE threshold below which images are considered similar
+        mse_threshold: Distance threshold above which images are considered dissimilar
+        distance_method: Function comparing a BGR video frame and BGR reference image.
+            Defaults to ``calculate_mse_between_frames``. For blue-screen
+            detection, use ``calculate_blue_screen_distance`` and set
+            ``mse_threshold`` between 0 and 1 (for example, 0.5 to classify
+            frames with less than 50% recognized blue as dissimilar).
     
     Returns:
         Tuple of (frame_no, frame_image) for the first dissimilar frame, or (None, None) if none found
     """
-    # Load reference image
-    ref_img = cv2.imread(reference_image_path)
-    if ref_img is None:
-        raise ValueError(f"Could not load reference image: {reference_image_path}")
+    if isinstance(reference_image_path, Image.Image):
+        ref_img = cv2.cvtColor(
+            np.asarray(reference_image_path.convert("RGB")), cv2.COLOR_RGB2BGR
+        )
+    else:
+        ref_path = os.fspath(reference_image_path)
+        ref_img = cv2.imread(ref_path)
+        if ref_img is None:
+            raise ValueError(f"Could not load reference image: {ref_path}")
     
-    image_iterator = get_image_iterator_from_file(video_file)
-    
-    for frame_no, frame_bgr in image_iterator:
+    frame_iterator = get_frame_iterator_from_file(video_file)
+    for _, frame_no, frame in frame_iterator:
         if frame_no <= min_frame:
             continue
-        
-        mse_value = calculate_mse_between_frames(frame_bgr, ref_img)
-        # print(f"Frame {frame_no}: MSE={mse_value:.2f}")
-        if mse_value > mse_threshold:  # Not similar
+
+        frame_bgr = frame.to_ndarray(format="bgr24")
+        distance = distance_method(frame_bgr, ref_img)
+        if distance > mse_threshold:
+            if with_time:
+                return frame_no, frame_bgr, frame.time
             return frame_no, frame_bgr
-    
-    return None, None  # No dissimilar frame found
+
+    return (None, None, None) if with_time else (None, None)
+
+
+def _load_reference_bgr(reference_image: str | os.PathLike[str] | Image.Image) -> np.ndarray:
+    if isinstance(reference_image, Image.Image):
+        return cv2.cvtColor(np.asarray(reference_image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    ref_path = os.fspath(reference_image)
+    ref_img = cv2.imread(ref_path)
+    if ref_img is None:
+        raise ValueError(f"Could not load reference image: {ref_path}")
+    return ref_img
+
+
+def find_last_dissimilar_frame(
+    video_file,
+    reference_image: str | os.PathLike[str] | Image.Image,
+    known_dissimilar_frame: int = 0,
+    mse_threshold: float = 1000.0,
+    distance_method: Callable[[np.ndarray, np.ndarray], float] = calculate_mse_between_frames,
+    on_probe: Callable[[int, float], None] | None = None,
+):
+    """
+    Find the last dissimilar frame, i.e. the start of a trailing run of frames that
+    resemble the reference, using bisection with random-access seeks instead of
+    decoding the whole file.
+
+    Assumes constant frame rate and that everything after the returned frame is
+    similar to the reference (a single trailing run). Isolated similar frames
+    between ``known_dissimilar_frame`` and the tail are NOT detected.
+
+    Args:
+        known_dissimilar_frame: Frame number already known to be dissimilar (for
+            example the result of ``find_first_dissimilar_frame``). Bisection
+            starts from here.
+        on_probe: Optional callback `(frame_index, distance)` invoked for every
+            probed frame, e.g. to display bisection progress.
+
+    Returns:
+        (frame_no, frame_bgr) of the last dissimilar frame. If the final frame is
+        itself dissimilar there is no trailing run and the final frame is returned.
+        (None, None) if ``known_dissimilar_frame`` is beyond the end of the video.
+    """
+    import av
+
+    ref_img = _load_reference_bgr(reference_image)
+
+    with av.open(os.fspath(video_file)) as container:
+        stream = container.streams.video[0]
+        rate = float(stream.average_rate)
+        time_base = float(stream.time_base)
+        start_pts = stream.start_time or 0
+
+        frame_count = stream.frames
+        if not frame_count:
+            frame_count = round(float(container.duration) / av.time_base * rate)
+
+        def frame_at(index: int) -> np.ndarray | None:
+            target_pts = start_pts + round(index / rate / time_base)
+            container.seek(target_pts, backward=True, any_frame=False, stream=stream)
+            for frame in container.decode(stream):
+                if frame.pts is not None and frame.pts >= target_pts - 1:
+                    return frame.to_ndarray(format="bgr24")
+            return None
+
+        def is_dissimilar(index: int) -> tuple[bool, np.ndarray | None]:
+            image = frame_at(index)
+            if image is None:
+                return False, None
+            distance = distance_method(image, ref_img)
+            if on_probe is not None:
+                on_probe(index, distance)
+            return distance > mse_threshold, image
+
+        # Last decodable frame (the declared count can be off by a frame or two).
+        hi = frame_count - 1
+        while hi > known_dissimilar_frame:
+            last_dissimilar, last_image = is_dissimilar(hi)
+            if last_image is not None:
+                break
+            hi -= 1
+        else:
+            return None, None
+        if last_dissimilar:
+            return hi, last_image
+
+        lo = known_dissimilar_frame
+        lo_image = frame_at(lo)
+        # Invariant: lo is dissimilar, hi is similar.
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            dissimilar, image = is_dissimilar(mid)
+            if image is None:
+                hi = mid
+            elif dissimilar:
+                lo, lo_image = mid, image
+            else:
+                hi = mid
+        return lo, lo_image
+
+
+def find_last_dissimilar_frame_time(
+    video_file,
+    reference_image: str | os.PathLike[str] | Image.Image,
+    known_dissimilar_time: float,
+    mse_threshold: float = 1000.0,
+    distance_method: Callable[[np.ndarray, np.ndarray], float] = calculate_mse_between_frames,
+    on_probe: Callable[[float, float], None] | None = None,
+    distance_method_at_time: Callable[[float, np.ndarray], float] | None = None,
+    known_similar_time: float | None = None,
+):
+    """
+    Like ``find_last_dissimilar_frame`` but bisects on presentation time, so it
+    needs neither a constant frame rate nor a frame index.
+
+    Args:
+        known_dissimilar_time: Presentation time (seconds, as ``frame.time``) of a
+            frame already known to be dissimilar.
+        on_probe: Optional callback `(time_s, distance)` for every probed frame.
+        distance_method_at_time: Optional time-aware distance override used for
+            endpoint and bisection probes, for example to validate a surrounding
+            frame window.
+        known_similar_time: Optional presentation time already known to be
+            similar. When supplied, it is used as the bisection upper bound
+            instead of discovering the final frame of the file.
+
+    Returns:
+        (time_s, frame_bgr) of the last dissimilar frame, using the same time
+        base as ``frame.time``. (None, None) if the known frame is at or after
+        the last decodable frame and no later frame exists.
+    """
+    import av
+
+    ref_img = _load_reference_bgr(reference_image)
+
+    with av.open(os.fspath(video_file)) as container:
+        stream = container.streams.video[0]
+        time_base = float(stream.time_base)
+        # Stop bisecting below half a nominal frame: no other frame fits there.
+        min_gap = max(1, round(0.5 / float(stream.average_rate) / time_base))
+        lo = round(known_dissimilar_time / time_base)
+
+        def frame_from(target_pts: int):
+            container.seek(target_pts, backward=True, any_frame=False, stream=stream)
+            for frame in container.decode(stream):
+                if frame.pts is not None and frame.pts >= target_pts:
+                    return frame.pts, frame.to_ndarray(format="bgr24")
+            return None, None
+
+        def distance_at(pts: int, image: np.ndarray) -> float:
+            if distance_method_at_time is not None:
+                return distance_method_at_time(pts * time_base, image)
+            return distance_method(image, ref_img)
+
+        def probe(target_pts: int):
+            pts, image = frame_from(target_pts)
+            if image is None:
+                return None, None, False
+            distance = distance_at(pts, image)
+            if on_probe is not None:
+                on_probe(pts * time_base, distance)
+            return pts, image, distance > mse_threshold
+
+        if known_similar_time is not None:
+            target = round(known_similar_time / time_base)
+            last_pts, last_image = frame_from(target)
+            if last_pts is None or last_image is None or last_pts <= lo:
+                return None, None
+            distance = distance_at(last_pts, last_image)
+            if on_probe is not None:
+                on_probe(last_pts * time_base, distance)
+            if distance > mse_threshold:
+                return None, None
+        else:
+            # Last frame of the file: seek slightly before the end (seeking
+            # past it yields nothing on some containers, e.g. MPEG-TS) and
+            # widen the margin until frames decode, then keep the final one.
+            stream_end_s = (
+                float(container.duration) / av.time_base
+                + (stream.start_time or 0) * time_base
+            )
+            last_pts, last_image = None, None
+            for margin_s in (1, 2, 4, 8, 16, 32, 64):
+                target = max(lo, round((stream_end_s - margin_s) / time_base))
+                container.seek(target, backward=True, any_frame=False, stream=stream)
+                for frame in container.decode(stream):
+                    if frame.pts is not None:
+                        last_pts, last_image = frame.pts, frame.to_ndarray(format="bgr24")
+                if last_image is not None or target == lo:
+                    break
+            if last_image is None or last_pts < lo:
+                return None, None
+            distance = distance_at(last_pts, last_image)
+            if on_probe is not None:
+                on_probe(last_pts * time_base, distance)
+            if distance > mse_threshold:
+                return last_pts * time_base, last_image
+            if last_pts == lo:
+                return None, None
+
+        lo_pts, lo_image = frame_from(lo)
+        hi = last_pts  # exclusive search ceiling; frames at/after it are similar
+        # Invariant: lo is dissimilar; everything from hi on is similar.
+        while hi - lo > min_gap:
+            mid = (lo + hi) // 2
+            pts, image, dissimilar = probe(mid)
+            if image is None or pts >= hi:
+                hi = mid
+            elif dissimilar:
+                lo, lo_image = pts, image
+            else:
+                hi = pts
+        return lo * time_base, lo_image
 
 
 
