@@ -169,6 +169,10 @@ How it works:
    content frame (or end of file). Content frames are never lost; extra blue or
    static frames may be kept.
 4. **Cut with ffmpeg stream copy** (`build_ffmpeg_command`): `-map 0 -map_metadata 0 -map_chapters 0 -c copy`.
+   FFmpeg runs with `-loglevel warning -stats`: its progress updates and warnings
+   remain visible while informational stream details are suppressed. Blank
+   lines separate the detected-area report, printed FFmpeg commands, each
+   FFmpeg invocation, and the script's completion messages.
    - `-ss` is the *first content frame's time*, not the keyframe time: seeking at the keyframe
      time landed on an earlier keyframe on the sample file (Matroska); a time inside the GOP lands
      on the right keyframe.

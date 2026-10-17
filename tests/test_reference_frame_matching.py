@@ -309,6 +309,30 @@ def test_main_skips_full_signal_classification_by_default(
     assert trim_blue_ends.main([str(video), "--dry-run"]) == 0
 
 
+def test_ffmpeg_commands_keep_stats_at_warning_log_level() -> None:
+    command = trim_blue_ends.build_ffmpeg_command(
+        Path("source.mkv"), Path("output.mkv"), 0.0, 0.0, None, False
+    )
+
+    assert command[1:5] == [
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-stats",
+    ]
+
+
+def test_ffmpeg_run_is_surrounded_by_blank_lines(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        trim_blue_ends.subprocess,
+        "run",
+        lambda *_: SimpleNamespace(returncode=0),
+    )
+
+    assert trim_blue_ends._run_ffmpeg(["ffmpeg"]) == 0
+    assert capsys.readouterr().out == "\n\n\n\n\n\n"
+
+
 @pytest.mark.parametrize(
     ("blue_window_distance", "expected_keep_start"),
     [(0.0, 5.0), (1.0, 0.0)],
@@ -587,6 +611,7 @@ def test_trim_report_is_repeated_after_ffmpeg(tmp_path, monkeypatch, capsys) -> 
     ) == 0
     output = capsys.readouterr().out
     assert output.count(report) == 2
+    assert f"{report}\n\n\nffmpeg" in output
     assert [command[0].name for command in built_commands] == [
         "source_trimmed.mkv",
         "source_begin.mkv",

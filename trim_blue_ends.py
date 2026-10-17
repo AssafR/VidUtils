@@ -333,7 +333,8 @@ def build_ffmpeg_command(
     # it may be included: frames can only be added, never lost.
     duration_args = [] if end_s is None else ["-t", f"{end_s - seek_s:.6f}"]
     return [
-        "ffmpeg", "-hide_banner", "-y" if overwrite else "-n",
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats",
+        "-y" if overwrite else "-n",
         "-ss", f"{seek_s:.6f}",
         *duration_args,
         "-i", str(video_file),
@@ -342,6 +343,14 @@ def build_ffmpeg_command(
         "-avoid_negative_ts", "make_zero",
         str(output_file),
     ]
+
+
+def _run_ffmpeg(command: list[str]) -> int:
+    print("\n\n", flush=True)
+    try:
+        return subprocess.run(command).returncode
+    finally:
+        print("\n\n", flush=True)
 
 
 def build_inspection_clip_commands(
@@ -667,6 +676,7 @@ def main(argv: list[str] | None = None) -> int:
         video, seek_s, end_s, beginning_types, ending_types
     )
     print(report)
+    print("\n", flush=True)
 
     command = build_ffmpeg_command(
         video, output, seek_s, start_s, end_s, args.overwrite
@@ -691,10 +701,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
-    result = subprocess.run(command)
+    result = _run_ffmpeg(command)
     try:
-        if result.returncode != 0:
-            return result.returncode
+        if result != 0:
+            return result
         out_first, out_last = video_pts_span(output)
         # Output times are shifted to start near 0; the span must cover the content.
         if out_last - out_first < last_time - first_time - 1e-3:
@@ -703,13 +713,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Wrote {output} (video spans {out_last - out_first:.3f}s)")
         for inspection_path, inspection_command in inspection_commands:
-            inspection_result = subprocess.run(inspection_command)
-            if inspection_result.returncode != 0:
+            inspection_result = _run_ffmpeg(inspection_command)
+            if inspection_result != 0:
                 print(
                     f"ERROR: failed to write inspection clip {inspection_path}",
                     file=sys.stderr,
                 )
-                return inspection_result.returncode
+                return inspection_result
             print(f"Wrote inspection clip {inspection_path}")
         return 0
     finally:
