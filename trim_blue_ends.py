@@ -219,7 +219,7 @@ def find_content_range(
     if first_no is None or first_time is None:
         raise SystemExit("No content frame found; the video appears entirely blue or static.")
 
-    with tqdm(desc="Bisection search for trailing removable streak", unit=" probes") as bar:
+    with tqdm(desc="* Bisection search for trailing removable streak", unit=" probes") as bar:
         def on_probe(time_s: float, distance: float) -> None:
             bar.update(1)
             bar.set_postfix(t=f"{time_s:.3f}s", distance=f"{distance:.3f}")
@@ -435,7 +435,7 @@ def scan_signal_types(
         if start_s > 0.0:
             target_pts = round((start_s + origin) / time_base)
             container.seek(target_pts, backward=True, any_frame=False, stream=stream)
-        with tqdm(desc=description, unit=" frames") as progress:
+        with tqdm(desc=f"* {description}", unit=" frames") as progress:
             for frame in container.decode(stream):
                 progress.update(1)
                 if frame.pts is None:
@@ -654,9 +654,9 @@ def main(argv: list[str] | None = None) -> int:
             seek_s = 0.0
 
     print(
-        f"Content starts at frame #{first_no} ({first_time:.3f}s); "
+        f"* Content starts at frame #{first_no} ({first_time:.3f}s); "
         f"trailing search boundary at {last_time:.3f}s\n"
-        f"Keep range: {seek_s:.3f}s .. "
+        f"* Keep range: {seek_s:.3f}s .. "
         f"{'end of file' if end_s is None else f'{end_s:.3f}s'}"
     )
 
@@ -675,7 +675,7 @@ def main(argv: list[str] | None = None) -> int:
     report = describe_removed_areas(
         video, seek_s, end_s, beginning_types, ending_types
     )
-    print(report)
+    print(f"* {report}")
     print("\n", flush=True)
 
     command = build_ffmpeg_command(
@@ -694,10 +694,10 @@ def main(argv: list[str] | None = None) -> int:
     if output.resolve() in inspection_paths:
         parser.error("--output must not use a *_begin.mkv or *_end.mkv inspection filename")
 
-    print(" ".join(command))
+    print(f"* {' '.join(command)}")
     for inspection_path, inspection_command in inspection_commands:
-        print(f"Inspection clip {inspection_path}:")
-        print(" ".join(inspection_command))
+        print(f"** Inspection clip {inspection_path}:")
+        print(f"** {' '.join(inspection_command)}")
     if args.dry_run:
         return 0
 
@@ -708,22 +708,22 @@ def main(argv: list[str] | None = None) -> int:
         out_first, out_last = video_pts_span(output)
         # Output times are shifted to start near 0; the span must cover the content.
         if out_last - out_first < last_time - first_time - 1e-3:
-            print(f"ERROR: output video spans {out_last - out_first:.3f}s, shorter than "
+            print(f"* ERROR: output video spans {out_last - out_first:.3f}s, shorter than "
                   f"the content ({last_time - first_time:.3f}s); cut is wrong.", file=sys.stderr)
             return 1
-        print(f"Wrote {output} (video spans {out_last - out_first:.3f}s)")
+        print(f"* Wrote {output} (video spans {out_last - out_first:.3f}s)")
         for inspection_path, inspection_command in inspection_commands:
             inspection_result = _run_ffmpeg(inspection_command)
             if inspection_result != 0:
                 print(
-                    f"ERROR: failed to write inspection clip {inspection_path}",
+                    f"** ERROR: failed to write inspection clip {inspection_path}",
                     file=sys.stderr,
                 )
                 return inspection_result
-            print(f"Wrote inspection clip {inspection_path}")
+            print(f"** Wrote inspection clip {inspection_path}")
         return 0
     finally:
-        print(report)
+        print(f"* {report}")
 
 if __name__ == "__main__":
     sys.exit(main())

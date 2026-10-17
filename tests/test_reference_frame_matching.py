@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 import save_frame_from_file
 import trim_blue_ends
+import vidfile_iterator
 from trim_blue_ends import (
     DEFAULT_BLACK_ENTROPY_THRESHOLD,
     DEFAULT_NOISE_ENTROPY_THRESHOLD,
@@ -56,6 +57,20 @@ def _mock_video_frames(monkeypatch, frames: list[tuple[int, np.ndarray]]) -> Non
         "get_frame_iterator_from_file",
         lambda _video_file: frame_iterator,
     )
+
+
+def test_frame_iterator_does_not_print_startup_message(monkeypatch, capsys) -> None:
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["trim_blue_ends.py", "source.mkv"])
+    monkeypatch.setattr(
+        vidfile_iterator,
+        "FileFrameIterator",
+        lambda _filename: SimpleNamespace(frame_iterator=iter(())),
+    )
+
+    assert list(get_frame_iterator_from_file("source.mkv")) == []
+    assert capsys.readouterr().out == ""
 
 
 def _collect_blue_transition_samples(
@@ -372,7 +387,7 @@ def test_short_leading_edge_is_removed_only_when_blue_is_confirmed(
 
     assert trim_blue_ends.main([str(video), "--dry-run"]) == 0
     assert blue_only_checks == [True]
-    assert f"Keep range: {expected_keep_start:.3f}s" in capsys.readouterr().out
+    assert f"* Keep range: {expected_keep_start:.3f}s" in capsys.readouterr().out
 
 
 def test_scan_signal_types_decodes_from_start_without_seeking(monkeypatch) -> None:
@@ -611,7 +626,7 @@ def test_trim_report_is_repeated_after_ffmpeg(tmp_path, monkeypatch, capsys) -> 
     ) == 0
     output = capsys.readouterr().out
     assert output.count(report) == 2
-    assert f"{report}\n\n\nffmpeg" in output
+    assert f"* {report}\n\n\n* ffmpeg" in output
     assert [command[0].name for command in built_commands] == [
         "source_trimmed.mkv",
         "source_begin.mkv",

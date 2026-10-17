@@ -702,10 +702,10 @@ def decode_group_by_pts_range(filename: str, start_pts: int, end_pts: int) -> fr
 def get_packet_iterator_from_file(filename):
     """Test the modern decoding approach in vidfile_iterator.py"""
     if len(sys.argv) < 2:
-        print("Usage: python test_vidfile_iterator.py <video_file>")
+        print("* Usage: python test_vidfile_iterator.py <video_file>")
         sys.exit(1)
     
-    print(f"Reading file: {filename}")
+    print(f"* Reading file: {filename}")
     
     # Create the frame iterator
     frame_iterator = FileFrameIterator(filename)
@@ -715,10 +715,8 @@ def get_packet_iterator_from_file(filename):
 def get_frame_iterator_from_file(filename):
     """Test the modern decoding approach in vidfile_iterator.py"""
     if len(sys.argv) < 2:
-        print("Usage: python test_vidfile_iterator.py <video_file>")
+        print("* Usage: python test_vidfile_iterator.py <video_file>")
         sys.exit(1)
-    
-    print(f"Testing modern decoding in vidfile_iterator.py with: {filename}")
     
     # Create the frame iterator
     frame_iterator = FileFrameIterator(filename)    

@@ -172,7 +172,9 @@ How it works:
    FFmpeg runs with `-loglevel warning -stats`: its progress updates and warnings
    remain visible while informational stream details are suppressed. Blank
    lines separate the detected-area report, printed FFmpeg commands, each
-   FFmpeg invocation, and the script's completion messages.
+   FFmpeg invocation, and the script's completion messages. Script-generated
+   status lines are prefixed with `*`; nested inspection-clip details use `**`.
+   The removable-area report is a depth-1 (`*`) status line.
    - `-ss` is the *first content frame's time*, not the keyframe time: seeking at the keyframe
      time landed on an earlier keyframe on the sample file (Matroska); a time inside the GOP lands
      on the right keyframe.
