@@ -11,7 +11,8 @@ uv run trim_blue_ends.py input.mp4 -o out.mkv --overwrite
 uv run trim_blue_ends.py input.mp4 --dry-run       # report ranges + ffmpeg commands only
 uv run trim_blue_ends.py input.mp4 --threshold 0.1  # conservative blue threshold (default)
 uv run trim_blue_ends.py input.mp4 --noise-entropy-threshold 4.5
-uv run trim_blue_ends.py input.mp4 --black-entropy-threshold 1.5
+uv run trim_blue_ends.py input.mp4 --black-entropy-threshold 1.9
+uv run trim_blue_ends.py input.mp4 --black-brightness-threshold 5
 uv run trim_blue_ends.py input.mp4 --min-removable-streak-seconds 10
 uv run trim_blue_ends.py input.mp4 --report-signal-types --dry-run
 ```
@@ -38,11 +39,11 @@ without creating any files.
   `tests/artifacts/vid_noise_at_end.mkv`. The older `is_proper_frame_params`
   heuristic uses `5.0`; the trimming threshold is intentionally more sensitive.
   Raise the cutoff to be more selective; lower it to classify more frames as static.
-- **Black-screen proxy:** a frame that is not classified as blue and whose local
-  entropy is at or below `--black-entropy-threshold` is labeled `BLACK` and is
-  removable. The default cutoff is `1.5`. This intentionally uses very low
-  entropy as a temporary black-screen proxy; it does not inspect pixel
-  brightness, so flat non-black images can also match.
+- **Black screen:** a frame that is not classified as blue is labeled `BLACK`
+  only when both its local entropy is at or below
+  `--black-entropy-threshold` (default `1.9`) and its mean 8-bit BGR intensity
+  is at or below `--black-brightness-threshold` (default `5`). Requiring both
+  measurements avoids treating dim, low-detail footage as black.
 - **Combined rule:** a frame is removable if either rule matches. The same
   per-frame rule applies to blue, black-proxy, and static signals. An edge is
   removed only after it passes the sustained-window check below.
@@ -53,27 +54,70 @@ The default minimum is 10 seconds, configured with
 `--min-removable-streak-seconds` (the older `--min-black-streak-seconds` spelling
 is still accepted). It applies to all removable signals, including STATIC.
 
-The trailing bisection checks each candidate against the 10 seconds
-immediately after it. It samples at 0.5-second intervals (or at the native
-frame interval for sources below 2 fps); at least 90% of those samples must
-match a removable signal, and the candidate frame itself must also match. This
-confirms a sustained run while allowing the cut to begin near its onset,
-instead of waiting for 10 seconds of signal to accumulate before the boundary.
-The terminal 10-second window is separately validated to provide the bisection
-with a confirmed removable upper bound. A leading edge likewise must last at
-least 10 seconds, with at least 90% of samples in the initial window matching.
-Exception: if the leading interval is shorter than 10 seconds, the script
-checks a blue-only window of up to one second from the start. At least 90% of
-its samples must be blue to confirm the edge; when confirmed, the leading
-interval is removed even though it is shorter than 10 seconds. A short
-static-only or black-only opening still needs to meet the 10-second minimum.
+#### Window score and the 90% rule
 
-By default the script reports the time ranges to remove without labeling their
-signal types. This avoids decoding every frame in a long removed tail just to
-produce a label. Add `--report-signal-types` to scan the full removed intervals
-and report BLUE, BLACK, STATIC, or combinations; this optional report can take
-substantial time on long tails and does not validate or change the bisection
-boundary.
+`calculate_removable_window_distance` samples a time interval and returns the
+fraction of samples that are **not removable**. The sample interval is 0.5
+seconds, or one frame interval for sources below 2 fps. With the default
+10-second interval and a 25 fps source, this gives 20 samples.
+
+Both edge searches use the same `is_confirmed_window` predicate:
+
+| Window being confirmed | Pass condition | Meaning |
+|---|---:|---|
+| Removable | non-removable fraction `<= 0.10` | At least 90% of samples are BLUE, BLACK, or STATIC. |
+| Informative | non-removable fraction `>= 0.90` | At least 90% of samples are not classified as removable. |
+
+The rule tolerates up to 10% of samples that disagree with the expected signal.
+It confirms a sustained pattern; it does not require every frame in a passing
+window to have the same label.
+
+#### Beginning trim
+
+The beginning search proceeds as follows:
+
+1. Check the first `--min-removable-streak-seconds` of the file. It must pass
+   the removable-window test (at least 90% removable).
+2. If it passes, scan forward for an informative candidate frame. The candidate
+   is accepted as the start of content only if the window from that frame
+   through the following minimum-streak interval passes the informative-window
+   test (at least 90% informative).
+3. The first candidate that passes is the leading content boundary. An
+   isolated content-classified frame inside a longer BLUE/BLACK/STATIC lead is
+   ignored if its following window is not sufficiently informative.
+4. If the initial window is removable but no informative streak can be
+   confirmed, the script keeps the beginning rather than cutting based on a
+   transient frame.
+
+The 90% allowance means a few removable samples may occur in the confirmed
+informative window, so the kept video can begin slightly before fully stable
+content. There is one short-opening exception: if the detected leading
+interval is shorter than the minimum, the script checks a blue-only window of
+up to one second from the start. At least 90% of its samples must be blue to
+remove that short BLUE lead. There is no corresponding short-opening exception
+for BLACK-only or STATIC-only footage.
+
+#### Ending trim
+
+The ending search uses a time-based bisection rather than decoding the whole
+video sequentially:
+
+1. A frame classified as informative is treated as content.
+2. A frame classified as removable is treated as part of the ending streak
+   only if the following minimum-streak interval passes the removable-window
+   test (at least 90% removable).
+3. The final minimum-streak interval is checked first to establish that a
+   removable tail exists. Bisection then locates the last content frame before
+   that confirmed tail.
+
+This places the cut near the start of the confirmed removable tail, not 10
+seconds after it. The trailing search assumes one final removable run;
+multiple separated transitions near EOF can violate its bisection assumption.
+
+By default, the script reports removable time ranges without labeling every
+frame. Add `--report-signal-types` to scan the removed intervals and report
+BLUE, BLACK, STATIC, or combinations. This optional scan can be slow on long
+intervals; it does not change or validate the selected boundaries.
 
 ### Static heuristic in detail
 
@@ -96,16 +140,19 @@ H = -sum(p(value) * log2(p(value)))
 The channel entropies are averaged. For an 8-bit channel, the theoretical range
 is 0–8 bits. A flat residual has entropy near 0; a residual whose values are
 spread across many bins has higher entropy. The current script classifies a
-frame as high-entropy static when `H >= 4.5` by default. The temporary
-black-screen proxy marks non-blue frames with `H <= 1.5` as `BLACK`.
+frame as high-entropy static when `H >= 4.5` by default. It classifies a
+non-blue frame as `BLACK` only when `H <= 1.9` and mean BGR intensity is at
+most 5 on the 0–255 scale.
 
 This is a useful signal, not a semantic guarantee that a frame is snow.
 Fine texture, film grain, detailed foliage, text, or compression artifacts can
 also raise local entropy. Conversely, heavily blurred, denoised, or low-bitrate
 static may score below the cutoff. Blue, high-entropy static, and the low-entropy black proxy are classified
 per-frame. A signal must also pass the 10-second sustained-window rule before
-an edge is removed. Adjust `--min-removable-streak-seconds` for sources where
-edge signals typically last longer or shorter.
+an edge is removed. The black entropy and brightness limits can be adjusted
+independently with `--black-entropy-threshold` and
+`--black-brightness-threshold`. Adjust `--min-removable-streak-seconds` for
+sources where edge signals typically last longer or shorter.
 
 The supplied models illustrate why the cutoff is source-dependent:
 
@@ -145,10 +192,10 @@ not currently use them or expose them as alternatives:
 | Metric/variant | What it could add | Main caveat |
 |---|---|---|
 | **Temporal entropy** (`calculate_temporal_entropy`) | Entropy of the pixel-wise difference between adjacent frames; flickering snow may score high. | Motion, scene cuts, and animation also produce large differences. |
-| **Combined local + temporal entropy** (`is_proper_frame`) | Uses local and temporal entropy together; the existing helper also checks mean brightness. | Its thresholds and “proper frame” semantics are not wired into this cutter; a black-frame rule would be a separate behavior change. |
+| **Combined local + temporal entropy** (`is_proper_frame`) | Uses local and temporal entropy together; the existing helper also checks mean brightness. | Its combined thresholds and “proper frame” semantics are not wired into this cutter. |
 | **Laplacian variance** (`calculate_laplacian_variance`) | Measures fine edges/high-frequency detail; static can cause a strong rise. | Sharp real content can also have high values, so absolute cutoffs are source-dependent. |
 | **FFT high-band ratio** (`calculate_fft_highband_ratio`) | Measures the proportion of image energy in high spatial frequencies. | More computation and parameters; high-frequency real texture may resemble static. |
-| **Persistence / hysteresis** | Require several consecutive frames, or a smoothed score, before declaring a streak. This can suppress isolated noisy frames. | It needs state across frames and a boundary search that respects the consecutive-frame rule; it is not implemented. |
+| **Per-frame hysteresis** | Require several consecutive decoded frames, or a smoothed score, before changing a frame's label. | The cutter currently confirms sampled fixed-duration windows instead; per-frame hysteresis is not implemented. |
 | **Adaptive/source-calibrated threshold** | Estimate a cutoff from labeled static and content samples, or normalize scores against a known content baseline. | Requires representative samples and must handle sources where the score distributions overlap. |
 
 `locate_noise.py` and `streaming_regime.py` are exploratory regime-change
@@ -156,48 +203,38 @@ tools: they analyze a stream of metrics such as Laplacian variance and detect
 upward jump-ratio crossings. They are not currently used by this script as a
 per-frame static classifier.
 
-How it works:
+### End-to-end processing pipeline
 
-1. **Find the first content frame**: forward scan with `find_first_dissimilar_frame(..., with_time=True)`.
-   A frame is content only if it is neither sufficiently blue nor above the
-   static-noise cutoff. Returns the frame number and its real presentation time.
-2. **Find the last content frame**: `find_last_dissimilar_frame_time` bisects on presentation
-   time using random-access seeks, so the long middle of the file is not decoded.
-   It only searches after the first content frame, so it cannot find the start
-   streak. If the last frame is content there is no trailing removable streak
-   and it is returned after a single probe.
-3. **Snap outward to keyframes** (`find_keyframe_bounds`, packets only, no decoding):
-   start = last keyframe at or before the first content frame; end = first keyframe after the last
-   content frame (or end of file). Content frames are never lost; extra blue or
-   static frames may be kept.
-4. **Cut with ffmpeg stream copy** (`build_ffmpeg_command`): `-map 0 -map_metadata 0 -map_chapters 0 -c copy`.
-   FFmpeg runs with `-loglevel warning -stats`: its progress updates and warnings
-   remain visible while informational stream details are suppressed. Blank
-   lines separate the detected-area report, printed FFmpeg commands, each
-   FFmpeg invocation, and the script's completion messages. Script-generated
-   status lines are prefixed with `*`; nested inspection-clip details use `**`.
-   The removable-area report is a depth-1 (`*`) status line.
-   - `-ss` is the *first content frame's time*, not the keyframe time: seeking at the keyframe
-     time landed on an earlier keyframe on the sample file (Matroska); a time inside the GOP lands
-     on the right keyframe.
-   - `-t` is `end - seek_s` (ffmpeg measures it from the seek point). It is applied on packet DTS,
-     so a couple of frames past the end keyframe can be included (extra blue only).
-5. **Check**: the output's video span (`video_pts_span`) must cover the content span, else exit 1.
+1. **Classify frames.** Blue-mask matches, high-entropy static, and guarded
+   near-black frames are removable signals. Other frames are treated as
+   informative for edge detection. “Informative” here means only “not
+   classified as removable”; it is not a semantic content detector.
+2. **Find the beginning boundary.** `find_content_range` gets an initial
+   content candidate, confirms the initial removable window, then searches for
+   the first candidate whose following minimum-streak window is at least 90%
+   informative. This is why a brief content-like dropout inside an opening
+   black/blue run does not by itself end the trim.
+3. **Find the ending boundary.** `find_last_dissimilar_frame_time` bisects on
+   presentation time. A removable candidate must have a following
+   minimum-streak window that is at least 90% removable. This avoids decoding
+   the long middle sequentially.
+4. **Snap and cut.** `find_keyframe_bounds` inspects packets and selects nearby
+   keyframe bounds. FFmpeg then stream-copies with
+   `-map 0 -map_metadata 0 -map_chapters 0 -c copy`. `-ss` uses the detected
+   boundary time, and `-t` is calculated from the seek point to the end bound.
+5. **Validate and report.** The output video span (`video_pts_span`) is checked
+   against the detected content span; validation failure exits with an error.
+   By default, the script reports interval times. `--report-signal-types`
+   additionally scans removed intervals and labels them BLUE, BLACK, STATIC,
+   or combinations; this can be slow on long intervals and does not change the
+   boundaries.
 
-The trailing bisection assumes the tail is one final removable run and does not
-fully scan the long interior. Multiple separated terminal/interior transitions
-can violate the binary-search assumption. The noise cutoff can also classify
-high-detail content as static, so review the reported removable areas (or use
-`--dry-run`) when working with a new source. Variable frame rate is untested;
-nominal frame rate is used only as a half-frame tolerance.
-
-By default, before ffmpeg runs the script reports only each removable interval
-and its time range. `--report-signal-types` opts into classifying every frame in
-the removed intervals as `BLUE`, `BLACK`, `STATIC`, or combinations. In
-particular, this extra report scan decodes a long ending streak after the
-bisection, so it can take substantial time; it does not decode the kept middle.
-The same report is printed again after ffmpeg and output validation finish, so
-it remains visible after ffmpeg's output.
+The trailing bisection assumes the tail is one final removable run. Multiple
+separated transitions near EOF can violate that assumption. The classifier can
+also mistake detailed real footage for static, and the 90% rule intentionally
+allows a small number of samples that disagree with a confirmed window. Review
+the proposed ranges with `--dry-run` when using a new source. Variable frame
+rate is untested; nominal frame rate is used only as a half-frame tolerance.
 
 The module docstring also documents a possible future "smart cut" (re-encode
 only the head GOP, copy the rest, concat) that is NOT implemented.
@@ -229,6 +266,25 @@ contains blue-toned footage before the true black screen. The detector must
 preserve content through about 24.64 s and snap the kept end to the 25 s
 keyframe; the earlier permissive blue threshold incorrectly cut around 14.8 s.
 
+The tracked `tests/data/low-entropy-black-ending.mkv` clip is a video-only,
+CRF 36 recompression of 2:25:00–2:26:10 from a second recording. It contains
+dim content followed by near-black frames with compressed-video residual
+entropy. The regression test verifies that both low entropy and very low mean
+brightness are required, so dim content is retained while the true black tail
+is removed.
+
+The tracked `tests/data/leading-black-outlier.mkv` clip is a video-only, CRF 36
+recompression of the first 30 seconds of another recording. Its first frame is
+a single flat gray outlier, followed by a sustained black lead and then content.
+The regression uses an 8-second confirmation interval because the clip ends
+before it contains a full 10-second informative streak.
+
+The tracked `tests/data/blue-black-opening-content-streak.mkv` clip is a
+video-only, CRF 36 recompression of the first 75 seconds of a recording. It
+contains brief content-classified interruptions within an opening blue/black
+lead, followed by a sustained informative streak. The regression verifies that
+the isolated interruptions do not prematurely end the leading trim.
+
 ## Changes to `save_frame_from_file.py`
 
 - `find_first_dissimilar_frame(..., with_time=False)`: with `True` returns
@@ -241,30 +297,22 @@ keyframe; the earlier permissive blue threshold incorrectly cut around 14.8 s.
   when there is no content after the known frame.
 - `calculate_blue_screen_distance`: distance = 1 - blue fraction (HSV), default threshold 0.1.
 
-## Tests: `tests/test_reference_frame_matching.py`
+## Automated regression tests
 
-Renamed from `test_find_first_dissimilar_frame.py` (it covers both first and last). The tests
-include a real-video test on `tests/vid_with_blue_HD.mp4` (blue frames 0-92 and 2825-2986,
-content 93-2824 at 25 fps), a classifier test for blue/static/content, optional model-video
-boundary tests for `tests/artifacts/vid_with_noise.mkv` and
-`tests/artifacts/vid_noise_at_end.mkv`, and the existing blue bisection test.
-The bisection test has a tqdm bar and per-probe lines (run with `-s` to see them live).
-Tracked regression inputs belong in `tests/data/`; temporary/local artifacts
-go to the git-ignored `tests/artifacts/`.
-
-```
-uv run pytest tests/test_reference_frame_matching.py -q
-```
-
-The focused run after adding static-noise handling and interval reporting passed all 10 tests:
+The focused suite is `tests/test_reference_frame_matching.py`:
 
 ```
 uv run pytest tests\test_reference_frame_matching.py -q
 ```
 
-The no-trailing-blue case is still checked manually, not covered by an automated
-test (see below). Two tests in `tests/test_frame_metrics_pipeline.py` fail independently of this work.
-Two tests in `tests/test_frame_metrics_pipeline.py` fail independently of this work.
+It covers the frame classifiers, blue matching, boundary detection, reporting,
+and the tracked media regressions described above. In particular,
+`test_leading_boundary_waits_for_sustained_informative_content` verifies that
+brief content-classified interruptions do not stop a leading trim before a
+sustained informative streak is confirmed.
+
+Tracked regression inputs belong in `tests/data/`; temporary or local-only
+artifacts belong in the git-ignored `tests/artifacts/`.
 
 ## Temporary clips used for manual checks
 

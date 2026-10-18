@@ -14,6 +14,7 @@ import trim_blue_ends
 import vidfile_iterator
 from trim_blue_ends import (
     DEFAULT_BLACK_ENTROPY_THRESHOLD,
+    DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
     DEFAULT_BLUE_THRESHOLD,
     DEFAULT_NOISE_ENTROPY_THRESHOLD,
     calculate_removable_signal_distance,
@@ -39,6 +40,15 @@ NOISE_VIDEO_PATH = Path(__file__).parent / "artifacts" / "vid_with_noise.mkv"
 NOISE_AT_END_PATH = Path(__file__).parent / "artifacts" / "vid_noise_at_end.mkv"
 DARK_TRANSITION_VIDEO_PATH = (
     Path(__file__).parent / "data" / "dark-transition-boundary.mkv"
+)
+LOW_ENTROPY_BLACK_VIDEO_PATH = (
+    Path(__file__).parent / "data" / "low-entropy-black-ending.mkv"
+)
+LEADING_BLACK_OUTLIER_VIDEO_PATH = (
+    Path(__file__).parent / "data" / "leading-black-outlier.mkv"
+)
+BLUE_BLACK_OPENING_VIDEO_PATH = (
+    Path(__file__).parent / "data" / "blue-black-opening-content-streak.mkv"
 )
 
 
@@ -204,6 +214,43 @@ def test_removable_signal_classifier_recognizes_blue_static_black_and_content() 
     assert calculate_removable_signal_distance(black) <= BLUE_DISTANCE_THRESHOLD
     assert calculate_removable_signal_distance(noise) <= BLUE_DISTANCE_THRESHOLD
     assert calculate_removable_signal_distance(content) > BLUE_DISTANCE_THRESHOLD
+
+
+def test_low_entropy_is_not_black_without_very_low_brightness() -> None:
+    bright_flat_content = np.full((32, 32, 3), 30, dtype=np.uint8)
+    black = np.zeros((32, 32, 3), dtype=np.uint8)
+    dark_frame_with_codec_residual = np.full((32, 32, 3), 2, dtype=np.uint8)
+
+    assert DEFAULT_BLACK_BRIGHTNESS_THRESHOLD == pytest.approx(5.0)
+    assert DEFAULT_BLACK_ENTROPY_THRESHOLD == pytest.approx(1.9)
+    assert classify_signal_types(
+        bright_flat_content,
+        DEFAULT_BLUE_THRESHOLD,
+        DEFAULT_NOISE_ENTROPY_THRESHOLD,
+        DEFAULT_BLACK_ENTROPY_THRESHOLD,
+    ) == set()
+    assert (
+        calculate_removable_signal_distance(bright_flat_content)
+        > DEFAULT_BLUE_THRESHOLD
+    )
+    assert classify_signal_types(
+        black,
+        DEFAULT_BLUE_THRESHOLD,
+        DEFAULT_NOISE_ENTROPY_THRESHOLD,
+        DEFAULT_BLACK_ENTROPY_THRESHOLD,
+    ) == {"BLACK"}
+    assert trim_blue_ends.is_black_frame(
+        dark_frame_with_codec_residual,
+        entropy=1.85,
+        black_entropy_threshold=DEFAULT_BLACK_ENTROPY_THRESHOLD,
+        black_brightness_threshold=DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
+    )
+    assert not trim_blue_ends.is_black_frame(
+        dark_frame_with_codec_residual,
+        entropy=1.95,
+        black_entropy_threshold=DEFAULT_BLACK_ENTROPY_THRESHOLD,
+        black_brightness_threshold=DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
+    )
 
 
 def test_removable_window_distance_requires_90_percent_matching_frames(
@@ -608,6 +655,54 @@ def test_trailing_cut_preserves_content_until_actual_darkness() -> None:
     )
     assert start_s == pytest.approx(0.0, abs=0.04)
     assert end_s == pytest.approx(25.0, abs=0.05)
+
+
+def test_dark_low_entropy_tail_is_removed_but_dim_content_is_kept() -> None:
+    first_no, first_time, last_time = find_content_range(
+        LOW_ENTROPY_BLACK_VIDEO_PATH, DEFAULT_BLUE_THRESHOLD
+    )
+
+    assert first_no == 0
+    assert first_time == pytest.approx(0.0, abs=0.04)
+    assert 19.0 <= last_time <= 24.0
+
+    start_s, end_s = find_keyframe_bounds(
+        LOW_ENTROPY_BLACK_VIDEO_PATH, first_time, last_time
+    )
+    assert start_s == pytest.approx(0.0, abs=0.04)
+    assert end_s is not None
+    assert 20.0 <= end_s <= 25.0
+
+
+def test_leading_black_is_found_after_a_single_content_outlier() -> None:
+    initial_window_distance = calculate_removable_window_distance(
+        LEADING_BLACK_OUTLIER_VIDEO_PATH,
+        0.0,
+        10.0,
+        DEFAULT_BLUE_THRESHOLD,
+        DEFAULT_NOISE_ENTROPY_THRESHOLD,
+        DEFAULT_BLACK_ENTROPY_THRESHOLD,
+        black_brightness_threshold=DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
+    )
+    assert trim_blue_ends.is_confirmed_removable_window(initial_window_distance)
+
+    first_no, first_time, _ = find_content_range(
+        LEADING_BLACK_OUTLIER_VIDEO_PATH,
+        DEFAULT_BLUE_THRESHOLD,
+        minimum_streak_seconds=8.0,
+    )
+
+    assert first_no > 0
+    assert first_time == pytest.approx(20.52, abs=0.5)
+
+
+def test_leading_boundary_waits_for_sustained_informative_content() -> None:
+    first_no, first_time, _ = find_content_range(
+        BLUE_BLACK_OPENING_VIDEO_PATH, DEFAULT_BLUE_THRESHOLD
+    )
+
+    assert first_no > 0
+    assert first_time == pytest.approx(61.0, abs=0.5)
 
 
 def test_trim_report_is_repeated_after_ffmpeg(tmp_path, monkeypatch, capsys) -> None:

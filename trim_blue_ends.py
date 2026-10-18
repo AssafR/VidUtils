@@ -49,11 +49,24 @@ import numpy as np
 
 DEFAULT_BLUE_THRESHOLD = 0.1
 DEFAULT_NOISE_ENTROPY_THRESHOLD = 4.5
-DEFAULT_BLACK_ENTROPY_THRESHOLD = 1.5
+DEFAULT_BLACK_ENTROPY_THRESHOLD = 1.9
+DEFAULT_BLACK_BRIGHTNESS_THRESHOLD = 5.0
 DEFAULT_MIN_REMOVABLE_STREAK_SECONDS = 10.0
 MIN_REMOVABLE_WINDOW_FRACTION = 0.9
 REMOVABLE_WINDOW_SAMPLE_INTERVAL_SECONDS = 0.5
 LEADING_BLUE_CONFIRMATION_SECONDS = 1.0
+
+
+def is_black_frame(
+    frame_bgr: np.ndarray,
+    entropy: float,
+    black_entropy_threshold: float,
+    black_brightness_threshold: float,
+) -> bool:
+    return (
+        entropy <= black_entropy_threshold
+        and float(np.mean(frame_bgr)) <= black_brightness_threshold
+    )
 
 
 def calculate_removable_signal_distance(
@@ -61,12 +74,18 @@ def calculate_removable_signal_distance(
     _reference_bgr: np.ndarray | None = None,
     noise_entropy_threshold: float = DEFAULT_NOISE_ENTROPY_THRESHOLD,
     black_entropy_threshold: float = DEFAULT_BLACK_ENTROPY_THRESHOLD,
+    black_brightness_threshold: float = DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
 ) -> float:
-    """Return a blue-distance value, treating static and very-low-entropy frames as removable."""
+    """Return blue distance, treating static and truly dark frames as removable."""
     from save_frame_from_file import calculate_blue_screen_distance, calculate_local_entropy
 
     entropy = calculate_local_entropy(frame_bgr)
-    if entropy >= noise_entropy_threshold or entropy <= black_entropy_threshold:
+    if entropy >= noise_entropy_threshold or is_black_frame(
+        frame_bgr,
+        entropy,
+        black_entropy_threshold,
+        black_brightness_threshold,
+    ):
         return 0.0
     return calculate_blue_screen_distance(frame_bgr)
 
@@ -76,6 +95,7 @@ def classify_signal_types(
     blue_threshold: float,
     noise_entropy_threshold: float,
     black_entropy_threshold: float,
+    black_brightness_threshold: float = DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
 ) -> set[str]:
     from save_frame_from_file import calculate_blue_screen_distance, calculate_local_entropy
 
@@ -84,7 +104,12 @@ def classify_signal_types(
     entropy = calculate_local_entropy(frame_bgr)
     if is_blue:
         kinds.add("BLUE")
-    elif entropy <= black_entropy_threshold:
+    elif is_black_frame(
+        frame_bgr,
+        entropy,
+        black_entropy_threshold,
+        black_brightness_threshold,
+    ):
         kinds.add("BLACK")
     if entropy >= noise_entropy_threshold:
         kinds.add("STATIC")
@@ -100,6 +125,7 @@ def calculate_removable_window_distance(
     black_entropy_threshold: float,
     *,
     blue_only: bool = False,
+    black_brightness_threshold: float = DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
 ) -> float:
     """Return the non-removable fraction in a stream-relative time window."""
     if end_s <= start_s:
@@ -146,6 +172,7 @@ def calculate_removable_window_distance(
                         image,
                         noise_entropy_threshold=noise_entropy_threshold,
                         black_entropy_threshold=black_entropy_threshold,
+                        black_brightness_threshold=black_brightness_threshold,
                     )
                 total_samples += 1
                 if distance <= blue_threshold:
@@ -168,12 +195,75 @@ def calculate_removable_window_distance(
     return 1.0 - removable_samples / total_samples
 
 
+def is_confirmed_removable_window(nonremovable_fraction: float) -> bool:
+    return is_confirmed_window(nonremovable_fraction, removable=True)
+
+
+def is_confirmed_informative_window(nonremovable_fraction: float) -> bool:
+    return is_confirmed_window(nonremovable_fraction, removable=False)
+
+
+def is_confirmed_window(
+    nonremovable_fraction: float, *, removable: bool
+) -> bool:
+    matching_fraction = (
+        1.0 - nonremovable_fraction if removable else nonremovable_fraction
+    )
+    return matching_fraction >= MIN_REMOVABLE_WINDOW_FRACTION
+
+
+def find_first_sustained_informative_frame(
+    video_file: Path,
+    threshold: float,
+    noise_entropy_threshold: float,
+    black_entropy_threshold: float,
+    minimum_streak_seconds: float,
+    black_brightness_threshold: float,
+    duration_seconds: float,
+) -> tuple[int, float] | None:
+    import av
+
+    with av.open(str(video_file)) as container:
+        stream = container.streams.video[0]
+        time_base = float(stream.time_base)
+        origin = (stream.start_time or 0) * time_base
+        for frame_no, frame in enumerate(container.decode(stream)):
+            if frame.pts is None:
+                continue
+            frame_time = frame.pts * time_base
+            relative_time = frame_time - origin
+            if relative_time + minimum_streak_seconds > duration_seconds:
+                break
+            frame_bgr = frame.to_ndarray(format="bgr24")
+            frame_distance = calculate_removable_signal_distance(
+                frame_bgr,
+                noise_entropy_threshold=noise_entropy_threshold,
+                black_entropy_threshold=black_entropy_threshold,
+                black_brightness_threshold=black_brightness_threshold,
+            )
+            if frame_distance <= threshold:
+                continue
+            window_distance = calculate_removable_window_distance(
+                video_file,
+                relative_time,
+                relative_time + minimum_streak_seconds,
+                threshold,
+                noise_entropy_threshold,
+                black_entropy_threshold,
+                black_brightness_threshold=black_brightness_threshold,
+            )
+            if is_confirmed_informative_window(window_distance):
+                return frame_no, frame_time
+    return None
+
+
 def find_content_range(
     video_file: Path,
     threshold: float,
     noise_entropy_threshold: float = DEFAULT_NOISE_ENTROPY_THRESHOLD,
     black_entropy_threshold: float = DEFAULT_BLACK_ENTROPY_THRESHOLD,
     minimum_streak_seconds: float = DEFAULT_MIN_REMOVABLE_STREAK_SECONDS,
+    black_brightness_threshold: float = DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
 ) -> tuple[int, float, float]:
     """Return the leading content frame/time and conservative trailing boundary.
 
@@ -206,6 +296,7 @@ def find_content_range(
             reference_bgr,
             noise_entropy_threshold,
             black_entropy_threshold,
+            black_brightness_threshold,
         )
 
     first_no, _, first_time = find_first_dissimilar_frame(
@@ -219,6 +310,37 @@ def find_content_range(
     if first_no is None or first_time is None:
         raise SystemExit("No content frame found; the video appears entirely blue or static.")
 
+    search_first_time = first_time
+    if (
+        minimum_streak_seconds > 0.0
+        and duration_s >= minimum_streak_seconds
+    ):
+        leading_window_distance = calculate_removable_window_distance(
+            video_file,
+            0.0,
+            minimum_streak_seconds,
+            threshold,
+            noise_entropy_threshold,
+            black_entropy_threshold,
+            black_brightness_threshold=black_brightness_threshold,
+        )
+        if is_confirmed_removable_window(leading_window_distance):
+            leading_content = find_first_sustained_informative_frame(
+                video_file,
+                threshold,
+                noise_entropy_threshold,
+                black_entropy_threshold,
+                minimum_streak_seconds,
+                black_brightness_threshold,
+                duration_s,
+            )
+            if leading_content is not None:
+                first_no, first_time = leading_content
+                search_first_time = first_time
+            else:
+                first_no = 0
+                first_time = origin
+
     with tqdm(desc="* Bisection search for trailing removable streak", unit=" probes") as bar:
         def on_probe(time_s: float, distance: float) -> None:
             bar.update(1)
@@ -229,6 +351,7 @@ def find_content_range(
                 frame_bgr,
                 noise_entropy_threshold=noise_entropy_threshold,
                 black_entropy_threshold=black_entropy_threshold,
+                black_brightness_threshold=black_brightness_threshold,
             )
             if frame_distance > threshold:
                 return 1.0
@@ -245,21 +368,22 @@ def find_content_range(
                 threshold,
                 noise_entropy_threshold,
                 black_entropy_threshold,
+                black_brightness_threshold=black_brightness_threshold,
             )
-            if window_distance > 1.0 - MIN_REMOVABLE_WINDOW_FRACTION:
+            if not is_confirmed_removable_window(window_distance):
                 return 1.0
             return window_distance
 
         known_similar_time = None
         if minimum_streak_seconds > 0.0:
             known_similar_time = origin + duration_s - minimum_streak_seconds
-            if known_similar_time <= first_time:
+            if known_similar_time <= search_first_time:
                 return first_no, first_time - origin, duration_s
 
         last_time, _ = find_last_dissimilar_frame_time(
             video_file,
             reference,
-            known_dissimilar_time=first_time,
+            known_dissimilar_time=search_first_time,
             on_probe=on_probe,
             mse_threshold=(
                 threshold
@@ -422,6 +546,7 @@ def scan_signal_types(
     noise_entropy_threshold: float,
     black_entropy_threshold: float,
     description: str,
+    black_brightness_threshold: float = DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
 ) -> set[str]:
     """Classify every decoded video frame in a stream-relative interval."""
     import av
@@ -451,6 +576,7 @@ def scan_signal_types(
                         blue_threshold,
                         noise_entropy_threshold,
                         black_entropy_threshold,
+                        black_brightness_threshold,
                     )
                 )
     return kinds
@@ -463,6 +589,7 @@ def classify_removed_areas(
     blue_threshold: float,
     noise_entropy_threshold: float,
     black_entropy_threshold: float = DEFAULT_BLACK_ENTROPY_THRESHOLD,
+    black_brightness_threshold: float = DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
 ) -> tuple[set[str], set[str]]:
     """Return the signal types present in the full leading and trailing cut areas."""
     import av
@@ -475,6 +602,7 @@ def classify_removed_areas(
             video, 0.0, start_s, blue_threshold, noise_entropy_threshold,
             black_entropy_threshold,
             "Classifying beginning interval",
+            black_brightness_threshold,
         )
         if start_s > 0.005
         else set()
@@ -484,6 +612,7 @@ def classify_removed_areas(
             video, end_s, None, blue_threshold, noise_entropy_threshold,
             black_entropy_threshold,
             "Classifying ending interval",
+            black_brightness_threshold,
         )
         if end_s is not None and total - end_s > 0.005
         else set()
@@ -562,8 +691,15 @@ def main(argv: list[str] | None = None) -> int:
         "--black-entropy-threshold",
         type=float,
         default=DEFAULT_BLACK_ENTROPY_THRESHOLD,
-        help="Local-entropy cutoff at or below which a frame is treated as black "
-        f"(default {DEFAULT_BLACK_ENTROPY_THRESHOLD}; temporary proxy heuristic)",
+        help="Local-entropy cutoff for a BLACK candidate, also requiring low brightness "
+        f"(default {DEFAULT_BLACK_ENTROPY_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--black-brightness-threshold",
+        type=float,
+        default=DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
+        help="Maximum mean 8-bit BGR intensity for BLACK classification "
+        f"(default {DEFAULT_BLACK_BRIGHTNESS_THRESHOLD})",
     )
     parser.add_argument(
         "--min-removable-streak-seconds",
@@ -592,6 +728,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.black_entropy_threshold >= args.noise_entropy_threshold:
         parser.error("--black-entropy-threshold must be lower than --noise-entropy-threshold")
+    if not 0.0 <= args.black_brightness_threshold <= 255.0:
+        parser.error("--black-brightness-threshold must be between 0 and 255")
     if args.min_removable_streak_seconds < 0.0:
         parser.error("--min-removable-streak-seconds must be non-negative")
 
@@ -610,6 +748,7 @@ def main(argv: list[str] | None = None) -> int:
         args.noise_entropy_threshold,
         args.black_entropy_threshold,
         args.min_removable_streak_seconds,
+        args.black_brightness_threshold,
     )
     start_s, end_s = find_keyframe_bounds(video, first_time, last_time)
     import av
@@ -628,10 +767,10 @@ def main(argv: list[str] | None = None) -> int:
                     args.threshold,
                     args.noise_entropy_threshold,
                     args.black_entropy_threshold,
+                    black_brightness_threshold=args.black_brightness_threshold,
                 )
-                leading_edge_is_confirmed = (
+                leading_edge_is_confirmed = is_confirmed_removable_window(
                     leading_window_distance
-                    <= 1.0 - MIN_REMOVABLE_WINDOW_FRACTION
                 )
         elif first_time > 0.0:
             blue_confirmation_duration = min(
@@ -645,9 +784,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.noise_entropy_threshold,
                 args.black_entropy_threshold,
                 blue_only=True,
+                black_brightness_threshold=args.black_brightness_threshold,
             )
-            leading_edge_is_confirmed = (
-                blue_window_distance <= 1.0 - MIN_REMOVABLE_WINDOW_FRACTION
+            leading_edge_is_confirmed = is_confirmed_removable_window(
+                blue_window_distance
             )
         if not leading_edge_is_confirmed:
             start_s = 0.0
@@ -668,6 +808,7 @@ def main(argv: list[str] | None = None) -> int:
             args.threshold,
             args.noise_entropy_threshold,
             args.black_entropy_threshold,
+            args.black_brightness_threshold,
         )
     else:
         beginning_types = ending_types = None
