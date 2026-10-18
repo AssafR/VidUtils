@@ -14,6 +14,7 @@ import trim_blue_ends
 import vidfile_iterator
 from trim_blue_ends import (
     DEFAULT_BLACK_ENTROPY_THRESHOLD,
+    DEFAULT_BLUE_THRESHOLD,
     DEFAULT_NOISE_ENTROPY_THRESHOLD,
     calculate_removable_signal_distance,
     calculate_removable_window_distance,
@@ -36,6 +37,9 @@ BLUE_VIDEO_PATH = Path(__file__).with_name("vid_with_blue_HD.mp4")
 BLUE_DISTANCE_THRESHOLD = 0.6
 NOISE_VIDEO_PATH = Path(__file__).parent / "artifacts" / "vid_with_noise.mkv"
 NOISE_AT_END_PATH = Path(__file__).parent / "artifacts" / "vid_noise_at_end.mkv"
+DARK_TRANSITION_VIDEO_PATH = (
+    Path(__file__).parent / "data" / "dark-transition-boundary.mkv"
+)
 
 
 class _FakeVideoFrame:
@@ -156,6 +160,22 @@ def test_calculate_blue_screen_distance_measures_non_blue_pixel_fraction() -> No
     assert calculate_blue_screen_distance(blue) == 0.0
     assert calculate_blue_screen_distance(mixed) == 0.5
     assert calculate_blue_screen_distance(no_blue) == 1.0
+
+
+def test_default_blue_threshold_requires_a_high_blue_pixel_fraction() -> None:
+    blue = np.full((100, 100, 3), (255, 0, 0), dtype=np.uint8)
+    mostly_blue = blue.copy()
+    mostly_blue[:15] = (0, 0, 255)
+    near_solid_blue = blue.copy()
+    near_solid_blue[:5] = (0, 0, 255)
+
+    assert DEFAULT_BLUE_THRESHOLD == pytest.approx(0.1)
+    assert classify_signal_types(
+        mostly_blue, DEFAULT_BLUE_THRESHOLD, 10.0, -1.0
+    ) == set()
+    assert classify_signal_types(
+        near_solid_blue, DEFAULT_BLUE_THRESHOLD, 10.0, -1.0
+    ) == {"BLUE"}
 
 
 def test_removable_signal_classifier_recognizes_blue_static_black_and_content() -> None:
@@ -572,6 +592,22 @@ def test_noise_at_end_video_uses_default_cutoff() -> None:
     )
     assert beginning == set()
     assert ending == {"STATIC"}
+
+
+def test_trailing_cut_preserves_content_until_actual_darkness() -> None:
+    first_no, first_time, last_time = find_content_range(
+        DARK_TRANSITION_VIDEO_PATH, DEFAULT_BLUE_THRESHOLD
+    )
+
+    assert first_no == 0
+    assert first_time == pytest.approx(0.0, abs=0.04)
+    assert last_time == pytest.approx(24.64, abs=0.35)
+
+    start_s, end_s = find_keyframe_bounds(
+        DARK_TRANSITION_VIDEO_PATH, first_time, last_time
+    )
+    assert start_s == pytest.approx(0.0, abs=0.04)
+    assert end_s == pytest.approx(25.0, abs=0.05)
 
 
 def test_trim_report_is_repeated_after_ffmpeg(tmp_path, monkeypatch, capsys) -> None:

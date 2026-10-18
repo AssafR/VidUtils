@@ -9,7 +9,7 @@ Tooling to find leading and trailing blue "no signal" or high-entropy static
 uv run trim_blue_ends.py input.mp4                 # writes input_trimmed.mkv
 uv run trim_blue_ends.py input.mp4 -o out.mkv --overwrite
 uv run trim_blue_ends.py input.mp4 --dry-run       # report ranges + ffmpeg commands only
-uv run trim_blue_ends.py input.mp4 --threshold 0.6  # blue threshold
+uv run trim_blue_ends.py input.mp4 --threshold 0.1  # conservative blue threshold (default)
 uv run trim_blue_ends.py input.mp4 --noise-entropy-threshold 4.5
 uv run trim_blue_ends.py input.mp4 --black-entropy-threshold 1.5
 uv run trim_blue_ends.py input.mp4 --min-removable-streak-seconds 10
@@ -27,8 +27,10 @@ without creating any files.
 ### How blue and static are classified
 
 - **Blue:** `calculate_blue_screen_distance` returns the fraction of pixels not
-  recognized as blue by the HSV mask. The default `--threshold 0.6` means a
-  frame with distance at or below 0.6 is treated as blue/removable.
+  recognized as blue by the HSV mask. The default `--threshold 0.1` means at
+  least 90% of pixels must match the blue mask for a frame to be treated as
+  blue/removable. Raising the threshold is more permissive and can mistake
+  blue-toned footage for a blue screen.
 - **Static/noise:** `calculate_local_entropy` measures entropy in the
   high-frequency residual after Gaussian blur. A frame with local entropy at or
   above `--noise-entropy-threshold` is treated as static/removable. The default
@@ -221,6 +223,12 @@ entropy cutoff of 4.5, the dry run finds a trailing boundary at about 26.32 s.
 Each candidate is checked against the following 10 seconds, so the cut stays
 near the onset once a sustained run is confirmed.
 
+The tracked `tests/data/dark-transition-boundary.mkv` regression clip is a
+video-only, CRF 36 recompression of 30:50–32:50 from a customer recording. It
+contains blue-toned footage before the true black screen. The detector must
+preserve content through about 24.64 s and snap the kept end to the 25 s
+keyframe; the earlier permissive blue threshold incorrectly cut around 14.8 s.
+
 ## Changes to `save_frame_from_file.py`
 
 - `find_first_dissimilar_frame(..., with_time=False)`: with `True` returns
@@ -231,7 +239,7 @@ near the onset once a sustained run is confirmed.
   assumption), `on_probe(time_s, distance)` callback, and an optional
   time-aware distance callback for window-based checks. Returns `(None, None)`
   when there is no content after the known frame.
-- `calculate_blue_screen_distance`: distance = 1 - blue fraction (HSV), threshold 0.6.
+- `calculate_blue_screen_distance`: distance = 1 - blue fraction (HSV), default threshold 0.1.
 
 ## Tests: `tests/test_reference_frame_matching.py`
 
@@ -240,7 +248,8 @@ include a real-video test on `tests/vid_with_blue_HD.mp4` (blue frames 0-92 and 
 content 93-2824 at 25 fps), a classifier test for blue/static/content, optional model-video
 boundary tests for `tests/artifacts/vid_with_noise.mkv` and
 `tests/artifacts/vid_noise_at_end.mkv`, and the existing blue bisection test.
-The bisection test has a tqdm bar and per-probe lines (run with `-s` to see them live). Artifacts
+The bisection test has a tqdm bar and per-probe lines (run with `-s` to see them live).
+Tracked regression inputs belong in `tests/data/`; temporary/local artifacts
 go to the git-ignored `tests/artifacts/`.
 
 ```
