@@ -1,21 +1,25 @@
-# Blue-screen and static-noise detection and trimming
+# Content-focused video padding detection and trimming
 
-Tooling to find leading and trailing blue "no signal" or high-entropy static
-("snow") segments and cut them off a video without re-encoding.
+Tooling to find and remove uninformative padding at the beginning or end of a
+video, including blue screens, black frames, and high-entropy static ("snow"),
+without re-encoding.
 
-## `trim_blue_ends.py` (new script)
+## `trim_padding.py`
 
 ```
-uv run trim_blue_ends.py input.mp4                 # writes input_trimmed.mkv
-uv run trim_blue_ends.py input.mp4 -o out.mkv --overwrite
-uv run trim_blue_ends.py input.mp4 --dry-run       # report ranges + ffmpeg commands only
-uv run trim_blue_ends.py input.mp4 --threshold 0.1  # conservative blue threshold (default)
-uv run trim_blue_ends.py input.mp4 --noise-entropy-threshold 4.5
-uv run trim_blue_ends.py input.mp4 --black-entropy-threshold 1.9
-uv run trim_blue_ends.py input.mp4 --black-brightness-threshold 5
-uv run trim_blue_ends.py input.mp4 --min-removable-streak-seconds 10
-uv run trim_blue_ends.py input.mp4 --report-signal-types --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv -o tests\artifacts\sample.mkv --overwrite --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv --threshold 0.1 --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv --noise-entropy-threshold 4.5 --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv --black-entropy-threshold 1.9 --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv --black-brightness-threshold 5 --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv --min-removable-streak-seconds 10 --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv --report-signal-types --dry-run
 ```
+
+These examples use tracked test media, so they can be run from the repository
+root without substituting a filename. They are dry runs and do not write video
+files. Remove `--dry-run` to perform the cut.
 
 By default, the kept video is written next to the input as
 `{input}_trimmed.mkv`. When a beginning or ending area is removed, that area is
@@ -32,18 +36,17 @@ without creating any files.
   least 90% of pixels must match the blue mask for a frame to be treated as
   blue/removable. Raising the threshold is more permissive and can mistake
   blue-toned footage for a blue screen.
-- **Static/noise:** `calculate_local_entropy` measures entropy in the
-  high-frequency residual after Gaussian blur. A frame with local entropy at or
-  above `--noise-entropy-threshold` is treated as static/removable. The default
-  is `4.5`, tuned to detect the sustained static in
-  `tests/artifacts/vid_noise_at_end.mkv`. The older `is_proper_frame_params`
-  heuristic uses `5.0`; the trimming threshold is intentionally more sensitive.
-  Raise the cutoff to be more selective; lower it to classify more frames as static.
 - **Black screen:** a frame that is not classified as blue is labeled `BLACK`
   only when both its local entropy is at or below
   `--black-entropy-threshold` (default `1.9`) and its mean 8-bit BGR intensity
   is at or below `--black-brightness-threshold` (default `5`). Requiring both
   measurements avoids treating dim, low-detail footage as black.
+- **Static/noise:** `calculate_local_entropy` measures entropy in the
+  high-frequency residual after Gaussian blur. A frame with local entropy at or
+  above `--noise-entropy-threshold` is treated as static/removable. The default
+  is `4.5`. The older `is_proper_frame_params` heuristic uses `5.0`; the
+  trimming threshold is intentionally more sensitive.
+  Raise the cutoff to be more selective; lower it to classify more frames as static.
 - **Combined rule:** a frame is removable if either rule matches. The same
   per-frame rule applies to blue, black-proxy, and static signals. An edge is
   removed only after it passes the sustained-window check below.
@@ -96,6 +99,19 @@ interval is shorter than the minimum, the script checks a blue-only window of
 up to one second from the start. At least 90% of its samples must be blue to
 remove that short BLUE lead. There is no corresponding short-opening exception
 for BLACK-only or STATIC-only footage.
+
+When the initial window passes, step 2 displays an open-ended progress bar with
+the decoded frame count, current source timestamp, and frames-per-second rate.
+It intentionally has no percentage or ETA: the scan stops as soon as a
+following minimum-streak window confirms informative content, rather than
+scanning the whole file. The displayed speed includes time spent validating
+candidate windows. If no such window is found, it can scan to the last point
+where a full confirmation window fits. To see this stage on a tracked sample,
+run:
+
+```
+uv run trim_padding.py tests\data\blue-black-opening-content-streak.mkv --dry-run
+```
 
 #### Ending trim
 
@@ -154,39 +170,39 @@ independently with `--black-entropy-threshold` and
 `--black-brightness-threshold`. Adjust `--min-removable-streak-seconds` for
 sources where edge signals typically last longer or shorter.
 
-The supplied models illustrate why the cutoff is source-dependent:
-
-- In `vid_with_noise.mkv`, inspected static sections score roughly 5.2–7.1.
-- In `vid_noise_at_end.mkv`, the sustained tail is mostly around 4.7–5.0,
-  below the previous 5.0 cutoff. The 10-second forward check confirms the
-  trailing run while allowing the cut to begin near its onset.
-
-These values depend on the clip, resolution, encoding, and decoder; they are
-not universal calibration values.
+Entropy scores depend on the clip, resolution, encoding, and decoder; the
+default cutoff is not a universal calibration value. Use the runnable sample
+measurement below, then compare representative static and content frames from
+the video being tuned.
 
 #### Tuning the current cutoff
 
-The only static-classifier setting currently exposed by `trim_blue_ends.py` is
+The only static-classifier setting currently exposed by `trim_padding.py` is
 `--noise-entropy-threshold`. To tune it for a new source:
 
 1. Decode representative frames known to be snow/static and representative
    frames of real content, including the most detailed content.
 2. Measure their scores with `calculate_local_entropy(frame_bgr)` from
-   `save_frame_from_file.py`.
+   `save_frame_from_file.py`. For a quick, copy-pasteable sample measurement:
+
+   ```
+   uv run python -c "import av,sys; from save_frame_from_file import calculate_local_entropy; c=av.open(sys.argv[1]); f=next(c.decode(video=0)); print('first-frame local entropy:', calculate_local_entropy(f.to_ndarray(format='bgr24')))" tests\data\low-entropy-black-ending.mkv
+   ```
+
 3. Choose a cutoff that separates those two sets with some margin. If the
    score ranges overlap, a single entropy cutoff cannot reliably distinguish
    them; a higher cutoff favors avoiding false removals, while a lower cutoff
    catches weaker static at the cost of more false positives.
-4. Run `trim_blue_ends.py ... --dry-run` and review the printed removable
-   intervals before running a cut. For example:
+4. Run the command below and review the printed removable intervals before
+   running a cut:
 
 ```
-uv run trim_blue_ends.py input.mkv --noise-entropy-threshold 5.5 --dry-run
+uv run trim_padding.py tests\data\low-entropy-black-ending.mkv --noise-entropy-threshold 5.5 --dry-run
 ```
 
 #### Other metrics and possible variants
 
-The repository has other noise-related metrics, but `trim_blue_ends.py` does
+The repository has other noise-related metrics, but `trim_padding.py` does
 not currently use them or expose them as alternatives:
 
 | Metric/variant | What it could add | Main caveat |
@@ -201,7 +217,18 @@ not currently use them or expose them as alternatives:
 `locate_noise.py` and `streaming_regime.py` are exploratory regime-change
 tools: they analyze a stream of metrics such as Laplacian variance and detect
 upward jump-ratio crossings. They are not currently used by this script as a
-per-frame static classifier.
+per-frame static classifier. To run the exploratory scan on tracked media, use:
+
+```
+uv run locate_noise.py tests\data\blue-black-opening-content-streak.mkv
+```
+
+The scan displays a frame window on a desktop. The underlying regime-break
+logic has a non-visual automated test:
+
+```
+uv run pytest tests\test_streaming_regime.py -q
+```
 
 ### End-to-end processing pipeline
 
@@ -239,26 +266,18 @@ rate is untested; nominal frame rate is used only as a half-frame tolerance.
 The module docstring also documents a possible future "smart cut" (re-encode
 only the head GOP, copy the rest, concat) that is NOT implemented.
 
-### Static-noise model clip
+### Tracked regression-media examples
 
-The provided `tests/artifacts/vid_with_noise.mkv` contains a leading blue
-streak, short static bursts inside the footage, and a short static tail. With
-the default thresholds and 10-second minimum:
+The following commands preview tracked regression inputs without writing
+outputs:
 
 ```
-uv run trim_blue_ends.py tests\artifacts\vid_with_noise.mkv --dry-run
+uv run trim_padding.py tests\data\dark-transition-boundary.mkv --dry-run
+uv run trim_padding.py tests\data\low-entropy-black-ending.mkv --dry-run
+uv run trim_padding.py tests\data\leading-black-outlier.mkv --dry-run --min-removable-streak-seconds 8
+uv run trim_padding.py tests\data\blue-black-opening-content-streak.mkv --dry-run
+uv run trim_padding.py tests\data\trailing-keyframe-overlap.mkv --dry-run
 ```
-
-finds the first content frame at #141 / 5.64 s, but keeps from the beginning
-because the leading streak is shorter than 10 seconds. The trailing signal also
-does not pass the sustained-window check, so the clip is kept through EOF.
-Short internal static bursts are not treated as removable edges.
-
-The additional `tests/artifacts/vid_noise_at_end.mkv` model is a 53-second clip
-with no leading blue/noise and a sustained static ending. With the default
-entropy cutoff of 4.5, the dry run finds a trailing boundary at about 26.32 s.
-Each candidate is checked against the following 10 seconds, so the cut stays
-near the onset once a sustained run is confirmed.
 
 The tracked `tests/data/dark-transition-boundary.mkv` regression clip is a
 video-only, CRF 36 recompression of 30:50–32:50 from a customer recording. It
@@ -285,6 +304,45 @@ contains brief content-classified interruptions within an opening blue/black
 lead, followed by a sustained informative streak. The regression verifies that
 the isolated interruptions do not prematurely end the leading trim.
 
+The tracked `tests/data/trailing-keyframe-overlap.mkv` clip is a compact
+recompression of the reported ending transition. Its regression generates both
+the kept output and the `_end.mkv` inspection clip, then verifies by decoded
+frame hashes that pre-cut frames in the inspection clip are also kept, while
+end-only frames after the cut are BLACK.
+
+### Reproducing a trailing-cut comparison
+
+Run this PowerShell sequence from the repository root to create the sample
+outputs and inspect them:
+
+```
+New-Item -ItemType Directory -Force tests\artifacts | Out-Null
+Copy-Item -Force tests\data\trailing-keyframe-overlap.mkv tests\artifacts\trailing-keyframe-overlap.mkv
+uv run trim_padding.py tests\artifacts\trailing-keyframe-overlap.mkv --overwrite
+uv run inspect_trim_boundary.py tests\artifacts\trailing-keyframe-overlap.mkv
+```
+
+The inspector reruns the detector by default and reads the matching
+`*_trimmed.mkv` and `*_end.mkv` outputs. To inspect a specific boundary or
+non-default outputs, supply the source-stream cut time and paths. For the
+fixture above:
+
+```
+uv run inspect_trim_boundary.py tests\artifacts\trailing-keyframe-overlap.mkv --cut-time 9.000 --kept-output tests\artifacts\trailing-keyframe-overlap_trimmed.mkv --end-clip tests\artifacts\trailing-keyframe-overlap_end.mkv
+```
+
+Use `--window-seconds` to control how far on either side of the boundary to
+compare. The report hashes each decoded BGR24 frame with SHA-256 and matches
+source frames to each output by their full pixel hashes; it does not infer
+identity from timestamps, which can be shifted by stream-copy seeking. The
+table marks whether each source frame occurs in the kept output and/or the
+ending inspection clip, along with its signal classification, mean brightness,
+entropy, and hash prefix. Shared frames before the boundary are expected
+keyframe-seek overlap. The final summary counts only end-clip frames at or
+after the cut that have no matching frame in the kept output; those are the
+frames actually removed there. BLACK counts in that group confirm black frames
+were removed, rather than merely appearing in the inspection clip.
+
 ## Changes to `save_frame_from_file.py`
 
 - `find_first_dissimilar_frame(..., with_time=False)`: with `True` returns
@@ -296,6 +354,12 @@ the isolated interruptions do not prematurely end the leading trim.
   time-aware distance callback for window-based checks. Returns `(None, None)`
   when there is no content after the known frame.
 - `calculate_blue_screen_distance`: distance = 1 - blue fraction (HSV), default threshold 0.1.
+
+Run the tests for these frame-matching APIs with:
+
+```
+uv run pytest tests\test_reference_frame_matching.py -q
+```
 
 ## Automated regression tests
 
@@ -311,47 +375,50 @@ and the tracked media regressions described above. In particular,
 brief content-classified interruptions do not stop a leading trim before a
 sustained informative streak is confirmed.
 
+Run only the end-overlap regression with:
+
+```
+uv run pytest tests\test_reference_frame_matching.py -q -k trailing_inspection_clip_overlaps_kept_content_but_not_removed_black
+```
+
 Tracked regression inputs belong in `tests/data/`; temporary or local-only
 artifacts belong in the git-ignored `tests/artifacts/`.
 
-## Temporary clips used for manual checks
+## Inspecting packets and input-seek behavior
 
-All written to the git-ignored `tests/artifacts/` and deleted afterwards.
+The commands below use the kept output and fixture copy created in the
+preceding example.
 
-Clip without a trailing blue streak (first 100 s of the sample, stream copy):
-
-```
-ffmpeg -v error -y -t 100 -i tests\vid_with_blue_HD.mp4 -map 0 -c copy tests\artifacts\noend.mkv
-uv run trim_blue_ends.py tests\artifacts\noend.mkv -o tests\artifacts\noend_out.mkv --overwrite
-Remove-Item tests\artifacts\noend*.mkv
-```
-
-Expected: 1 bisection probe, "Keep ... .. end of file".
-
-Inspecting an output (frame count, first/last video packet, decode errors):
+To independently inspect the kept output's packet timestamps and decode it:
 
 ```
-ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=p=0 tests\artifacts\k.mkv
-ffmpeg -v error -i tests\artifacts\k.mkv -f null -
+ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=p=0 tests\artifacts\trailing-keyframe-overlap_trimmed.mkv
+ffmpeg -v error -i tests\artifacts\trailing-keyframe-overlap_trimmed.mkv -f null -
 ```
 
-Expected for the sample clip: keep range 2.480s..113.600s, first packet a keyframe, no decode
-errors. The output has 2780 video frames (2778 in range + 2 extra from `-t` on DTS).
-
-Probe of how ffmpeg's input seek lands (this showed `-ss 2.40-2.60` landing on the 0.12 s
-keyframe instead of 2.48 s):
+To observe how input-side stream-copy seeking lands on keyframes around the
+fixture's 9-second cut, run:
 
 ```
-foreach($s in '2.40','2.48','2.60','3.00','3.72'){
-  ffmpeg -hide_banner -loglevel error -y -ss $s -i tests\vid_with_blue_HD.mp4 -map 0:v -c copy -copyts -frames:v 5 tests\artifacts\d.mkv
+foreach($s in '8.40','8.52','8.96','9.00','9.04'){
+  ffmpeg -hide_banner -loglevel error -y -ss $s -i tests\artifacts\trailing-keyframe-overlap.mkv -map 0:v -c copy -copyts -frames:v 5 tests\artifacts\d.mkv
   ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,flags -of csv=p=0 tests\artifacts\d.mkv | Select-Object -First 2
 }
 ```
 
-Keyframe times of the source: `ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,dts_time,flags -of csv=p=0 tests\vid_with_blue_HD.mp4 | Select-String K`
+List the fixture's keyframe times with:
+
+```
+ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,dts_time,flags -of csv=p=0 tests\data\trailing-keyframe-overlap.mkv | Select-String K
+```
 
 ## Environment notes
 
-- Use `uv run ...` (not bare `python`). If `uv run pytest` fails with a "trampoline" error, the venv's
-  launcher stubs point to an old project location; re-sync the venv.
-- `tests/vid_with_blue_HD.mp4` is actually a Matroska container despite the extension.
+- Run Python commands through `uv run` (not bare `python`). If `uv run pytest` fails with a "trampoline" error, the venv's
+  launcher stubs point to an old project location, re-sync the environment with:
+
+  ```
+  uv sync
+  ```
+
+- Test videos that are meant to be portable are tracked in `tests/data/`.

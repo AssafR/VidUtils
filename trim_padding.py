@@ -1,24 +1,23 @@
-"""Remove leading and trailing blue-screen or static-noise segments from a video.
+"""Detect and trim uninformative padding at the beginning and end of a video.
 
 Usage:
-    uv run trim_blue_ends.py input.mp4
-    uv run trim_blue_ends.py input.mp4 -o trimmed.mkv
+    uv run trim_padding.py input.mp4
+    uv run trim_padding.py input.mp4 -o trimmed.mkv
 
 Writes ``{input}_trimmed.mkv`` next to the input. Removed beginning and ending
 areas are also saved as ``{input}_begin.mkv`` and ``{input}_end.mkv`` when
 present. All streams are kept (``-map 0``) and copied without re-encoding
 (fast).
 
-Cuts are snapped OUTWARD to keyframes so no content frame is ever lost; some
-blue frames may be kept instead:
-  * start: the last keyframe at or before the first non-blue frame;
-  * end:   the first keyframe after the last non-blue frame, i.e. the whole
-           GOP containing the blue transition is kept (or end of file).
+Cuts are snapped OUTWARD to keyframes so informative content is preserved;
+some removable padding may remain:
+  * start: the last keyframe at or before the first informative frame;
+  * end:   the first keyframe after the last informative frame.
 
-Frames classified as blue or high-entropy static are treated as removable.
-The first content frame is found by scanning forward, and the last by bisection
-with random-access seeks, so the (usually long) middle of the file is not
-decoded. The trailing search assumes the removable tail is a single final run.
+Blue screens, black frames, and high-entropy static/noise can be classified as
+removable. The beginning is scanned forward and the ending is searched with
+random-access seeks, avoiding decoding the (usually long) middle of the file.
+The trailing search assumes the removable padding is a single final run.
 
 Possible future option: "smart cut" (NOT implemented)
 -----------------------------------------------------
@@ -222,38 +221,45 @@ def find_first_sustained_informative_frame(
     duration_seconds: float,
 ) -> tuple[int, float] | None:
     import av
+    from tqdm import tqdm
 
     with av.open(str(video_file)) as container:
         stream = container.streams.video[0]
         time_base = float(stream.time_base)
         origin = (stream.start_time or 0) * time_base
-        for frame_no, frame in enumerate(container.decode(stream)):
-            if frame.pts is None:
-                continue
-            frame_time = frame.pts * time_base
-            relative_time = frame_time - origin
-            if relative_time + minimum_streak_seconds > duration_seconds:
-                break
-            frame_bgr = frame.to_ndarray(format="bgr24")
-            frame_distance = calculate_removable_signal_distance(
-                frame_bgr,
-                noise_entropy_threshold=noise_entropy_threshold,
-                black_entropy_threshold=black_entropy_threshold,
-                black_brightness_threshold=black_brightness_threshold,
-            )
-            if frame_distance <= threshold:
-                continue
-            window_distance = calculate_removable_window_distance(
-                video_file,
-                relative_time,
-                relative_time + minimum_streak_seconds,
-                threshold,
-                noise_entropy_threshold,
-                black_entropy_threshold,
-                black_brightness_threshold=black_brightness_threshold,
-            )
-            if is_confirmed_informative_window(window_distance):
-                return frame_no, frame_time
+        with tqdm(
+            desc="* Scanning for sustained leading content",
+            unit=" frames",
+        ) as progress:
+            for frame_no, frame in enumerate(container.decode(stream)):
+                progress.update(1)
+                if frame.pts is None:
+                    continue
+                frame_time = frame.pts * time_base
+                relative_time = frame_time - origin
+                progress.set_postfix(t=f"{relative_time:.1f}s", refresh=False)
+                if relative_time + minimum_streak_seconds > duration_seconds:
+                    break
+                frame_bgr = frame.to_ndarray(format="bgr24")
+                frame_distance = calculate_removable_signal_distance(
+                    frame_bgr,
+                    noise_entropy_threshold=noise_entropy_threshold,
+                    black_entropy_threshold=black_entropy_threshold,
+                    black_brightness_threshold=black_brightness_threshold,
+                )
+                if frame_distance <= threshold:
+                    continue
+                window_distance = calculate_removable_window_distance(
+                    video_file,
+                    relative_time,
+                    relative_time + minimum_streak_seconds,
+                    threshold,
+                    noise_entropy_threshold,
+                    black_entropy_threshold,
+                    black_brightness_threshold=black_brightness_threshold,
+                )
+                if is_confirmed_informative_window(window_distance):
+                    return frame_no, frame_time
     return None
 
 

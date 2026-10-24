@@ -10,9 +10,10 @@ from PIL import Image
 from tqdm import tqdm
 
 import save_frame_from_file
-import trim_blue_ends
+import trim_padding
 import vidfile_iterator
-from trim_blue_ends import (
+from inspect_trim_boundary import compare_boundary_frames
+from trim_padding import (
     DEFAULT_BLACK_ENTROPY_THRESHOLD,
     DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
     DEFAULT_BLUE_THRESHOLD,
@@ -50,6 +51,9 @@ LEADING_BLACK_OUTLIER_VIDEO_PATH = (
 BLUE_BLACK_OPENING_VIDEO_PATH = (
     Path(__file__).parent / "data" / "blue-black-opening-content-streak.mkv"
 )
+TRAILING_KEYFRAME_OVERLAP_VIDEO_PATH = (
+    Path(__file__).parent / "data" / "trailing-keyframe-overlap.mkv"
+)
 
 
 class _FakeVideoFrame:
@@ -76,7 +80,7 @@ def _mock_video_frames(monkeypatch, frames: list[tuple[int, np.ndarray]]) -> Non
 def test_frame_iterator_does_not_print_startup_message(monkeypatch, capsys) -> None:
     import sys
 
-    monkeypatch.setattr(sys, "argv", ["trim_blue_ends.py", "source.mkv"])
+    monkeypatch.setattr(sys, "argv", ["trim_padding.py", "source.mkv"])
     monkeypatch.setattr(
         vidfile_iterator,
         "FileFrameIterator",
@@ -239,13 +243,13 @@ def test_low_entropy_is_not_black_without_very_low_brightness() -> None:
         DEFAULT_NOISE_ENTROPY_THRESHOLD,
         DEFAULT_BLACK_ENTROPY_THRESHOLD,
     ) == {"BLACK"}
-    assert trim_blue_ends.is_black_frame(
+    assert trim_padding.is_black_frame(
         dark_frame_with_codec_residual,
         entropy=1.85,
         black_entropy_threshold=DEFAULT_BLACK_ENTROPY_THRESHOLD,
         black_brightness_threshold=DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
     )
-    assert not trim_blue_ends.is_black_frame(
+    assert not trim_padding.is_black_frame(
         dark_frame_with_codec_residual,
         entropy=1.95,
         black_entropy_threshold=DEFAULT_BLACK_ENTROPY_THRESHOLD,
@@ -283,7 +287,7 @@ def test_removable_window_distance_requires_90_percent_matching_frames(
 
     monkeypatch.setattr(av, "open", lambda *_: Container())
     monkeypatch.setattr(
-        trim_blue_ends,
+        trim_padding,
         "calculate_removable_signal_distance",
         lambda image, **_: 0.0 if image[0, 0, 0] < 18 else 1.0,
     )
@@ -292,7 +296,7 @@ def test_removable_window_distance_requires_90_percent_matching_frames(
     ) == pytest.approx(0.1)
 
     monkeypatch.setattr(
-        trim_blue_ends,
+        trim_padding,
         "calculate_removable_signal_distance",
         lambda image, **_: 0.0 if image[0, 0, 0] < 17 else 1.0,
     )
@@ -372,27 +376,27 @@ def test_main_skips_full_signal_classification_by_default(
 
     video = tmp_path / "source.mkv"
     video.touch()
-    monkeypatch.setattr(trim_blue_ends.shutil, "which", lambda _: "ffmpeg")
-    monkeypatch.setattr(trim_blue_ends, "find_content_range", lambda *args: (0, 0.0, 10.0))
-    monkeypatch.setattr(trim_blue_ends, "find_keyframe_bounds", lambda *args: (0.0, None))
+    monkeypatch.setattr(trim_padding.shutil, "which", lambda _: "ffmpeg")
+    monkeypatch.setattr(trim_padding, "find_content_range", lambda *args: (0, 0.0, 10.0))
+    monkeypatch.setattr(trim_padding, "find_keyframe_bounds", lambda *args: (0.0, None))
     monkeypatch.setattr(
         av,
         "open",
         lambda *_: nullcontext(SimpleNamespace(duration=10 * av.time_base)),
     )
     monkeypatch.setattr(
-        trim_blue_ends,
+        trim_padding,
         "classify_removed_areas",
         lambda *_: pytest.fail("full interval classification should be opt-in"),
     )
-    monkeypatch.setattr(trim_blue_ends, "describe_removed_areas", lambda *args: "No removable areas")
-    monkeypatch.setattr(trim_blue_ends, "build_ffmpeg_command", lambda *args: ["ffmpeg"])
+    monkeypatch.setattr(trim_padding, "describe_removed_areas", lambda *args: "No removable areas")
+    monkeypatch.setattr(trim_padding, "build_ffmpeg_command", lambda *args: ["ffmpeg"])
 
-    assert trim_blue_ends.main([str(video), "--dry-run"]) == 0
+    assert trim_padding.main([str(video), "--dry-run"]) == 0
 
 
 def test_ffmpeg_commands_keep_stats_at_warning_log_level() -> None:
-    command = trim_blue_ends.build_ffmpeg_command(
+    command = trim_padding.build_ffmpeg_command(
         Path("source.mkv"), Path("output.mkv"), 0.0, 0.0, None, False
     )
 
@@ -406,12 +410,12 @@ def test_ffmpeg_commands_keep_stats_at_warning_log_level() -> None:
 
 def test_ffmpeg_run_is_surrounded_by_blank_lines(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
-        trim_blue_ends.subprocess,
+        trim_padding.subprocess,
         "run",
         lambda *_: SimpleNamespace(returncode=0),
     )
 
-    assert trim_blue_ends._run_ffmpeg(["ffmpeg"]) == 0
+    assert trim_padding._run_ffmpeg(["ffmpeg"]) == 0
     assert capsys.readouterr().out == "\n\n\n\n\n\n"
 
 
@@ -433,26 +437,26 @@ def test_short_leading_edge_is_removed_only_when_blue_is_confirmed(
         blue_only_checks.append(kwargs.get("blue_only", False))
         return blue_window_distance
 
-    monkeypatch.setattr(trim_blue_ends.shutil, "which", lambda _: "ffmpeg")
+    monkeypatch.setattr(trim_padding.shutil, "which", lambda _: "ffmpeg")
     monkeypatch.setattr(
-        trim_blue_ends, "find_content_range", lambda *args: (100, 5.0, 10.0)
+        trim_padding, "find_content_range", lambda *args: (100, 5.0, 10.0)
     )
     monkeypatch.setattr(
-        trim_blue_ends, "find_keyframe_bounds", lambda *args: (0.0, None)
+        trim_padding, "find_keyframe_bounds", lambda *args: (0.0, None)
     )
     monkeypatch.setattr(
-        trim_blue_ends,
+        trim_padding,
         "calculate_removable_window_distance",
         window_distance,
     )
-    monkeypatch.setattr(trim_blue_ends, "describe_removed_areas", lambda *args: "report")
+    monkeypatch.setattr(trim_padding, "describe_removed_areas", lambda *args: "report")
     monkeypatch.setattr(
         av,
         "open",
         lambda *_: nullcontext(SimpleNamespace(duration=10 * av.time_base)),
     )
 
-    assert trim_blue_ends.main([str(video), "--dry-run"]) == 0
+    assert trim_padding.main([str(video), "--dry-run"]) == 0
     assert blue_only_checks == [True]
     assert f"* Keep range: {expected_keep_start:.3f}s" in capsys.readouterr().out
 
@@ -482,7 +486,7 @@ def test_scan_signal_types_decodes_from_start_without_seeking(monkeypatch) -> No
             return iter([frame])
 
     monkeypatch.setattr(av, "open", lambda *_: Container())
-    monkeypatch.setattr(trim_blue_ends, "classify_signal_types", lambda *_: {"BLACK"})
+    monkeypatch.setattr(trim_padding, "classify_signal_types", lambda *_: {"BLACK"})
     assert scan_signal_types(
         Path("source.mkv"), 0.0, 0.1, 0.6, 4.5, 1.5, "test scan"
     ) == {"BLACK"}
@@ -684,7 +688,7 @@ def test_leading_black_is_found_after_a_single_content_outlier() -> None:
         DEFAULT_BLACK_ENTROPY_THRESHOLD,
         black_brightness_threshold=DEFAULT_BLACK_BRIGHTNESS_THRESHOLD,
     )
-    assert trim_blue_ends.is_confirmed_removable_window(initial_window_distance)
+    assert trim_padding.is_confirmed_removable_window(initial_window_distance)
 
     first_no, first_time, _ = find_content_range(
         LEADING_BLACK_OUTLIER_VIDEO_PATH,
@@ -696,13 +700,88 @@ def test_leading_black_is_found_after_a_single_content_outlier() -> None:
     assert first_time == pytest.approx(20.52, abs=0.5)
 
 
-def test_leading_boundary_waits_for_sustained_informative_content() -> None:
+def test_leading_boundary_waits_for_sustained_informative_content(capsys) -> None:
     first_no, first_time, _ = find_content_range(
         BLUE_BLACK_OPENING_VIDEO_PATH, DEFAULT_BLUE_THRESHOLD
     )
 
     assert first_no > 0
     assert first_time == pytest.approx(61.0, abs=0.5)
+    progress_output = capsys.readouterr().err
+    assert "Scanning for sustained leading content" in progress_output
+    assert "t=" in progress_output
+    assert "%" not in progress_output
+
+
+@pytest.mark.skipif(
+    trim_padding.shutil.which("ffmpeg") is None,
+    reason="ffmpeg is required to create the kept and inspection clips",
+)
+def test_trailing_inspection_clip_overlaps_kept_content_but_not_removed_black(
+    tmp_path,
+) -> None:
+    first_no, first_time, last_time = find_content_range(
+        TRAILING_KEYFRAME_OVERLAP_VIDEO_PATH, DEFAULT_BLUE_THRESHOLD
+    )
+    assert first_no == 0
+    start_s, end_s = find_keyframe_bounds(
+        TRAILING_KEYFRAME_OVERLAP_VIDEO_PATH, first_time, last_time
+    )
+    assert end_s is not None
+
+    kept_output = tmp_path / "kept.mkv"
+    end_clip = tmp_path / "end.mkv"
+    commands = (
+        trim_padding.build_ffmpeg_command(
+            TRAILING_KEYFRAME_OVERLAP_VIDEO_PATH,
+            kept_output,
+            first_time,
+            start_s,
+            end_s,
+            True,
+        ),
+        trim_padding.build_ffmpeg_command(
+            TRAILING_KEYFRAME_OVERLAP_VIDEO_PATH,
+            end_clip,
+            end_s,
+            end_s,
+            None,
+            True,
+        ),
+    )
+    for command in commands:
+        trim_padding.subprocess.run(
+            command,
+            check=True,
+            stdout=trim_padding.subprocess.DEVNULL,
+            stderr=trim_padding.subprocess.PIPE,
+        )
+
+    comparison = compare_boundary_frames(
+        TRAILING_KEYFRAME_OVERLAP_VIDEO_PATH,
+        kept_output,
+        end_clip,
+        end_s,
+        window_seconds=1.0,
+    )
+    kept_indices = comparison.kept_source_indices
+    end_indices = comparison.end_source_indices
+    pre_cut_end_indices = {
+        index
+        for index in end_indices
+        if comparison.source_frames[index].time_s < end_s
+    }
+    removed_after_cut = [
+        comparison.source_frames[index]
+        for index in end_indices - kept_indices
+        if comparison.source_frames[index].time_s >= end_s
+    ]
+
+    assert comparison.shared_source_indices
+    assert pre_cut_end_indices
+    assert pre_cut_end_indices <= kept_indices
+    assert removed_after_cut
+    assert all("BLACK" in frame.signal_types for frame in removed_after_cut)
 
 
 def test_trim_report_is_repeated_after_ffmpeg(tmp_path, monkeypatch, capsys) -> None:
@@ -725,29 +804,29 @@ def test_trim_report_is_repeated_after_ffmpeg(tmp_path, monkeypatch, capsys) -> 
         built_commands.append((output_file, seek_s, start_s, end_s, overwrite))
         return ["ffmpeg", str(output_file)]
 
-    monkeypatch.setattr(trim_blue_ends.shutil, "which", lambda _: "ffmpeg")
-    monkeypatch.setattr(trim_blue_ends, "find_content_range", lambda *args: (10, 1.0, 9.0))
-    monkeypatch.setattr(trim_blue_ends, "find_keyframe_bounds", lambda *args: (0.5, 9.5))
+    monkeypatch.setattr(trim_padding.shutil, "which", lambda _: "ffmpeg")
+    monkeypatch.setattr(trim_padding, "find_content_range", lambda *args: (10, 1.0, 9.0))
+    monkeypatch.setattr(trim_padding, "find_keyframe_bounds", lambda *args: (0.5, 9.5))
     monkeypatch.setattr(
-        trim_blue_ends,
+        trim_padding,
         "classify_removed_areas",
         lambda *args: ({"BLUE", "STATIC"}, {"STATIC"}),
     )
-    monkeypatch.setattr(trim_blue_ends, "describe_removed_areas", lambda *args: report)
-    monkeypatch.setattr(trim_blue_ends, "build_ffmpeg_command", build_command)
+    monkeypatch.setattr(trim_padding, "describe_removed_areas", lambda *args: report)
+    monkeypatch.setattr(trim_padding, "build_ffmpeg_command", build_command)
     monkeypatch.setattr(
         av,
         "open",
         lambda *_: nullcontext(SimpleNamespace(duration=10 * av.time_base)),
     )
     monkeypatch.setattr(
-        trim_blue_ends.subprocess,
+        trim_padding.subprocess,
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0),
     )
-    monkeypatch.setattr(trim_blue_ends, "video_pts_span", lambda *_: (0.0, 9.5))
+    monkeypatch.setattr(trim_padding, "video_pts_span", lambda *_: (0.0, 9.5))
 
-    assert trim_blue_ends.main(
+    assert trim_padding.main(
         [
             str(video),
             "--min-removable-streak-seconds",
